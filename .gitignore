@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+
+# CI working files, generated inside the reviewed repo
+TICKET.md
+DIFF.patch
+review.json

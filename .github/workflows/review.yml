@@ -1,0 +1,165 @@
+name: review
+
+# Reusable workflow — the whole reviewer lives here, so every repo that calls it
+# runs the same prompt and the same posting logic. Callers hold only a trigger.
+#
+# Called like this (see README):
+#
+#   jobs:
+#     review:
+#       uses: tatia-bit/claude-pr-reviewer/.github/workflows/review.yml@main
+#       secrets: inherit
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        description: Claude model to review with.
+        type: string
+        default: claude-opus-5
+      max_turns:
+        description: Cap on agent turns, as a runaway-cost guard.
+        type: number
+        default: 40
+      reviewer_ref:
+        description: >-
+          Ref of this repository to take the prompt and posting script from.
+          Pin it alongside the `uses:` ref if you want a caller frozen to a
+          known prompt version.
+        type: string
+        default: main
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        description: From `claude setup-token` (Claude Pro/Max). Runs draw on that subscription's quota.
+        required: true
+      JIRA_API_TOKEN:
+        description: >-
+          Atlassian API token. Without it (or without the JIRA_* variables below)
+          reviews are unscored rather than failing.
+        required: false
+
+# The Jira site URL and account email are read from repository VARIABLES
+# (vars.JIRA_BASE_URL, vars.JIRA_EMAIL), not secrets. Neither is sensitive, and
+# secrets are write-only — storing them as secrets means a typo is invisible and
+# surfaces later as an unexplained HTTP 404 from Jira. As variables they can be
+# read back and checked with `gh variable list`.
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+
+    steps:
+      # The repository under review.
+      - uses: actions/checkout@v4
+
+      # This repository, for the prompt and the posting script. Public, so the
+      # caller's default GITHUB_TOKEN is enough — no PAT to provision per repo.
+      - name: Check out the reviewer
+        uses: actions/checkout@v4
+        with:
+          repository: tatia-bit/claude-pr-reviewer
+          ref: ${{ inputs.reviewer_ref }}
+          path: .reviewer
+
+      # Resolve the ticket key from the PR body and fetch the issue.
+      #
+      # The PR body is untrusted input, so it goes through `env:` and stays
+      # quoted — interpolating it with ${{ }} would execute shell metacharacters
+      # that anyone opening a PR could put in the description.
+      #
+      # REST v2, not v3: on Jira Cloud v3 returns `description` as Atlassian
+      # Document Format (a JSON tree), while v2 returns plain text.
+      #
+      # Every failure path here is non-fatal and writes TICKET.md explaining
+      # itself. A missing or unreadable ticket produces an unscored review, not a
+      # broken check — "degrades gracefully" is an acceptance criterion.
+      - name: Resolve Jira ticket
+        id: ticket
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ vars.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          set -uo pipefail
+
+          KEY=$(printf '%s' "${PR_BODY:-}" \
+                | grep -oE '[A-Z][A-Z0-9]+-[0-9]+' \
+                | head -1 || true)
+
+          if [ -z "$KEY" ]; then
+            echo "No ticket key in the PR description."
+            printf 'NO TICKET RESOLVED\n\nThe pull request description contains no Jira issue key.\n' > TICKET.md
+            { echo "resolved=false"; echo "key="; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Ticket key: $KEY"
+
+          if [ -z "${JIRA_BASE_URL:-}" ] || [ -z "${JIRA_API_TOKEN:-}" ]; then
+            printf 'NO TICKET RESOLVED\n\nKey %s was found, but Jira credentials are not configured for this repository.\n' "$KEY" > TICKET.md
+            { echo "resolved=false"; echo "key=$KEY"; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          STATUS=$(curl -sS -o /tmp/issue.json -w '%{http_code}' --max-time 30 \
+            -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+            -H 'Accept: application/json' \
+            "${JIRA_BASE_URL%/}/rest/api/2/issue/${KEY}?fields=summary,status,description" \
+            || echo 000)
+
+          if [ "$STATUS" != "200" ]; then
+            echo "Jira returned HTTP $STATUS for $KEY" >&2
+            printf 'NO TICKET RESOLVED\n\nKey %s appears in the description, but Jira returned HTTP %s. The key may be a typo, or the issue may not be readable with these credentials.\n' "$KEY" "$STATUS" > TICKET.md
+            { echo "resolved=false"; echo "key=$KEY"; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          jq -r '
+            "# " + .key + " — " + (.fields.summary // "(no summary)"),
+            "",
+            "Status: " + (.fields.status.name // "unknown"),
+            "",
+            "## Description",
+            "",
+            (.fields.description // "(no description)")
+          ' /tmp/issue.json > TICKET.md
+
+          { echo "resolved=true"; echo "key=$KEY"; } >> "$GITHUB_OUTPUT"
+          echo "Wrote TICKET.md ($(wc -c < TICKET.md) bytes)"
+
+      - name: Capture the diff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr diff "${{ github.event.pull_request.number }}" --patch > DIFF.patch
+          echo "DIFF.patch: $(wc -l < DIFF.patch) lines"
+
+      - name: Review
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            Follow the instructions in .reviewer/prompt/review-prompt.md exactly.
+
+            The resolved Jira ticket is in TICKET.md and the pull request diff is
+            in DIFF.patch, both at the repository root. The repository under review
+            is checked out — read whatever files you need for context.
+
+            Write your output to review.json in the repository root. Write nothing
+            else: do not post comments, do not edit any file, do not commit.
+          claude_args: |
+            --model ${{ inputs.model }}
+            --max-turns ${{ inputs.max_turns }}
+            --allowedTools Read,Write,Grep,Glob
+
+      # Posting lives here, not in the model's hands. Claude produces JSON; this
+      # turns it into a review. `if: always()` so a reviewer failure still leaves
+      # a visible comment rather than a silently green check.
+      - name: Post the review
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          TICKET_KEY: ${{ steps.ticket.outputs.key }}
+          TICKET_RESOLVED: ${{ steps.ticket.outputs.resolved }}
+        run: python3 .reviewer/scripts/post_review.py

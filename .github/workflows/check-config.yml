@@ -1,0 +1,105 @@
+name: check-config
+
+# Verifies a repo's reviewer wiring without invoking Claude — so you can prove the
+# Jira credentials work without spending subscription quota on a review.
+#
+# Checks, in order: the variables are set and look right; the credential
+# authenticates; the ticket is readable; and its description actually contains an
+# "Acceptance criteria" section (the only thing the requirements checklist scores
+# against — a ticket that reached Jira with its criteria mangled would otherwise
+# produce a confidently empty checklist).
+#
+# Call it from a reviewed repo:
+#
+#   on: workflow_dispatch
+#   jobs:
+#     check:
+#       uses: tatia-bit/claude-pr-reviewer/.github/workflows/check-config.yml@main
+#       secrets: inherit
+
+on:
+  workflow_call:
+    inputs:
+      ticket_key:
+        description: A ticket key that should be readable, e.g. MRP25CCENT-12.
+        type: string
+        default: MRP25CCENT-12
+    secrets:
+      JIRA_API_TOKEN:
+        required: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Jira wiring
+        env:
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ vars.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          KEY: ${{ inputs.ticket_key }}
+        run: |
+          set -uo pipefail
+          fail=0
+
+          echo "── configuration ─────────────────────────────"
+          echo "JIRA_BASE_URL   ${JIRA_BASE_URL:-(not set)}"
+          echo "JIRA_EMAIL      ${JIRA_EMAIL:-(not set)}"
+          if [ -n "${JIRA_API_TOKEN:-}" ]; then
+            echo "JIRA_API_TOKEN  set, ${#JIRA_API_TOKEN} characters"
+          else
+            echo "JIRA_API_TOKEN  (not set)"
+          fi
+          echo
+
+          if [ -z "${JIRA_BASE_URL:-}" ] || [ -z "${JIRA_EMAIL:-}" ] || [ -z "${JIRA_API_TOKEN:-}" ]; then
+            echo "INCOMPLETE — reviews will run but post as unscored."
+            exit 1
+          fi
+
+          case "$JIRA_BASE_URL" in
+            https://*.atlassian.net) : ;;
+            *) echo "WARN  base URL is not a https://*.atlassian.net address — check it"; fail=1 ;;
+          esac
+          case "$JIRA_EMAIL" in
+            *@*.*) : ;;
+            *) echo "WARN  JIRA_EMAIL does not look like an email address"; fail=1 ;;
+          esac
+
+          echo "── does the credential authenticate? ─────────"
+          S=$(curl -sS -o /tmp/me.json -w '%{http_code}' --max-time 30 \
+                -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+                "${JIRA_BASE_URL%/}/rest/api/2/myself" || echo 000)
+          if [ "$S" = "200" ]; then
+            echo "OK    authenticated as $(jq -r '.displayName // "?"' /tmp/me.json)"
+          else
+            echo "FAIL  HTTP $S"
+            echo "      401 → wrong token, or the email doesn't match the account that owns it."
+            echo "      404/000 → wrong base URL or the site is unreachable."
+            exit 1
+          fi
+
+          echo "── is the ticket readable? ───────────────────"
+          S=$(curl -sS -o /tmp/issue.json -w '%{http_code}' --max-time 30 \
+                -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+                "${JIRA_BASE_URL%/}/rest/api/2/issue/${KEY}?fields=summary,description" || echo 000)
+          if [ "$S" != "200" ]; then
+            echo "FAIL  $KEY → HTTP $S (missing key, or no permission on the project)"
+            exit 1
+          fi
+          echo "OK    $KEY — $(jq -r '.fields.summary // "?"' /tmp/issue.json)"
+
+          LEN=$(jq -r '(.fields.description // "") | length' /tmp/issue.json)
+          echo "      description: $LEN characters"
+          if jq -e '(.fields.description // "") | test("Acceptance criteria"; "i")' /tmp/issue.json >/dev/null; then
+            echo "OK    acceptance criteria section present — the checklist has something to score"
+          else
+            echo "FAIL  no 'Acceptance criteria' section in the description."
+            echo "      The reviewer would return an empty or invented checklist. Re-seed the ticket."
+            fail=1
+          fi
+
+          echo
+          [ "$fail" = "0" ] && echo "All checks passed — ready to review." \
+                            || echo "Completed with warnings above."
+          exit "$fail"

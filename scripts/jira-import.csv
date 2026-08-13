@@ -1,0 +1,1519 @@
+"Issue Key","Issue Type","Summary","Description"
+"MRP25CCENT-1","Story","Story 1.1 — Cluster migration (CFN → Terraform)","[MRP25CCENT-1] Story 1.1 — Cluster migration (CFN → Terraform) Created: 01/Jun/26  Updated: 03/Jun/26
+Status:
+To Do
+Project:
+MockRealProject - 25C - CentOS
+Fix versions:
+None
+
+Type:
+Story
+Priority:
+Medium
+Reporter:
+Bakhtiyar Shabdanov
+Assignee:
+Mathieu N
+Resolution:
+Unresolved
+Votes:
+0
+Labels:
+None
+
+Sprint:
+MRP25CCE Sprint 2
+
+ Description 
+ 
+Epic 1 — Platform Foundation. Migration story — the team is already deploying onto the Day-0 CloudFormation cluster while you swap it for a Terraform-managed one.
+
+Working with AI on this project
+Read Working with AI first — it covers how to work with Claude Code, the subscription cap, and the standard deliverables (including the required WORKING-WITH-AI.md memoir). This ticket only adds the story-specific pieces.
+
+Story
+Problem statement
+Framing for the team: the Day-0 cluster was built with CloudFormation because that's how it was originally done at this fictional company. The decision to migrate to Terraform is yours to defend — your PM (and a future interviewer) will ask ""why did you have a need to create Terraform code for launching the EKS cluster when CloudFormation already worked?"" Have an answer.
+The team's EKS cluster currently exists as a CloudFormation-managed stack — {{temporary-eks-cluster-$
+{ENVIRONMENT_STAGE}}} — brought up manually by the coordinator. It works; your teammates are already deploying onto it. Your job is to migrate it to Terraform without disrupting them:
+
+# Build a parallel Terraform-managed cluster in the same dev account, and modernize what was defensible-but-not-great in the CFN setup:make it IPv6-primary with nodes in private subnets and IPv6 egress (no NAT, no public IPv4 on nodes). The CFN cluster ran nodes in public subnets with a public IPv4 each — it worked, but AWS now charges for public IPv4 and that line item is visible on the team's bill. The migration is partly ""port it to Terraform"" and partly_""stop paying for IPv4.""_
+# Plan and execute a cutover so teammates' workloads keep working (or are scheduled for a brief flag day they're warned about).
+# Decommission the CloudFormation stack once the new cluster is verified.
+# Fill in the shared deploy-platform-tools.yaml workflow so it logs into your cluster (it ships as comments only — sequenced with other stories touching that file).
+
+This is a migration, not a greenfield build. The interview narrative isn't ""I wrote Terraform for an EKS cluster"" — it's ""I migrated a running cluster between infrastructure tools without taking down the team, and cut the IPv4 bill doing it."" The runbook, validation, and rollback plan are the deliverable; the Terraform is a sub-deliverable.
+
+h3. What you're walking into
+
+Read the Day-0 scaffold every team starts from (repos, empty stubs, OIDC-only IAM, the manual cluster, Terraform conventions). Specific to this story:
+
+* The cluster you're migrating off is a CloudFormation stack,{{temporary-eks-cluster-${ENVIRONMENT_STAGE}
+}}, that the coordinator brings up manually from the terminal (not via any workflow). Its CFN templates + Makefile live in the platform-tools repo under{{eks-cloudformation/}}; worker nodes are spot-priced in public subnets with a public IPv4 each. Read it before you replicate its shape.
+	•	K8s admin auth on it is the aws-auth ConfigMap, granting admin to the SSO Administrator role. Your cluster must reach parity (see acceptance criteria).
+	•	deploy-platform-tools.yaml ships as comments only — it does not point at anything yet. Part of your migration is filling it in so it logs into your cluster (aws eks update-kubeconfig --name <your-cluster>).
+	•	Other Epic-1 teammates build on top of you: 1.2 (IAM roles + access-entry mappings), 1.3 (ALB Controller + Gateway API), 1.4 (Karpenter on your base ASG), 1.5 (cert-manager / external-dns / Secrets CSI).
+	•	App-delivery teammates (3.1 / 3.3 / 3.5) are already deploying onto the CFN cluster in week 1 and won't pause — your cutover handles a moving target.
+Your own-branch work
+Build a VPC and an EKS cluster as two custom Terraform modules in{{terraform-infra-<BATCH>-<TEAM>}}, called from{{roots/environments/dev/main.tf}} (VPC first — EKS consumes its outputs), deployed via a terraform-deploy.yaml GHA workflow you write yourself (plus a destroy-on-PR-approval workflow). The conventions (root-per-env, no off-the-shelf modules, S3 native locking, branch model) are in the Day-0 scaffold.
+You own the module design — resource layout, naming, variables, how the two wire together, and how you debug it. The constraints below don't move, though: most are line items on the team's real AWS bill (public IPv4, NAT, instance size, node count, on-demand ratio), and this project runs on a budget the PM is watching. Treat them as requirements, not starting suggestions — deviating up is overprovisioning, not initiative.
+Bootstrap (one-time, local with SSO creds). Nothing IAM-shaped exists to let GHA apply your Terraform, so you break the chicken-and-egg from your laptop:
+	1	aws sso login with the coordinator-issued profile.
+	2	Create the S3 state-backend bucket by hand (aws s3 mb ... + versioning).
+	3	Apply a small bootstrap/ module that creates a minimal GHA Terraform IAM role — OIDC trust scoped to your repo + dev environment, just enough permissions to apply the rest.
+	4	Set its ARN as the IAM_ROLE env var on the dev GitHub environment.
+From there GHA runs every apply. This role is ad-hoc — Story 1.2 later PRs in the canonical shared role to replace it, so don't over-build it. Document the bootstrap in your runbook.
+VPC module.
+	•	IPv4 CIDR (unique across the org) plus an IPv6 CIDR (Amazon /56 or BYOIP — IPv6 is required).
+	•	3 public + 3 private subnets across 3 AZs.
+	•	Private subnets: IPv6-primary, nodes-only, outbound via an*Egress-Only IGW*, no public IPv4. (This is where the per-node IPv4 charge dies.)
+	•	Public subnets: dual-stack, LB-only — for future ALBs / NLBs.
+	•	No NAT Gateway. Standard IGW for the public subnets; EIGW for IPv6 egress from private subnets.
+	•	Must also support RDS later (3.x) — confirm those engine versions do IPv6 or plan to dual-stack the DB subnets; note it in the README.
+EKS module.
+	•	K8s version one release behind the latest EKS supports (verify on deploy day).
+	•	IPv6-primary (kubernetesNetworkConfig.ipFamily = ipv6), VPC CNI configured for IPv6 pods.
+	•	Nodes in private subnets, no public IPv4, outbound via EIGW.
+	•	Self-managed ASG (no managed node groups), t3.medium-class,mixed 20% on-demand / 80% spot, 0 base on-demand, min 1 / max 5 / desired 3, multi-AZ.
+	•	Add-ons via Terraform: VPC CNI (IPv6) + EBS CSI (plus any the version requires).
+	•	Security groups: minimal rules, only control-plane ↔ node ↔ API — and allow IPv6 where the CFN cluster had IPv4 rules.
+	•	This ASG hosts platform tools only (Karpenter, cert-manager, ingress); Karpenter (1.4) handles workload scaling later. Size for platform tools, not apps.
+EKS access entries (not aws-auth). Use access entries — the modern model. Day-one parity = admin for at least the SSO Administrator role and your bootstrap GHA role. Story 1.2 layers Developer/DevOps
+	•	the canonical role on later. Coordinate with 1.2 on where access-entry config lives (your EKS module vs. their IAM module) — pick one.
+IPv6 decisions doc (1–2 pages, graded). Subnet topology and why; EIGW vs NAT; which AWS services you confirmed do IPv6; known reachability gaps (see gotchas); the IPv4 cost math (before / after / what remains). Present it to teammates (~15 min) — explaining it is the point.
+The migration (the actual story). Write a migration runbook before cutover:
+	•	Parallel-run window — how long both clusters coexist, who deploys where during it.
+	•	Validation — how you show the new cluster is equivalent (diff add-ons, deploy a canary, confirm access-entry parity).
+	•	Cutover — fill in deploy-platform-tools.yaml so it logs into your cluster; coordinate with 3.1 / 3.3 / 3.5 to redeploy onto it.
+	•	Rollback — how long the CFN cluster stays alive, who calls it.
+	•	Decommission — tear the CFN stack down (make destroy) once burned in.
+You own the decisions in the runbook (window length, rollback criteria, cutover scheduling); Claude can draft it. deploy-platform-tools.yaml is shared — see gotchas for merge sequencing.
+Acceptance criteria
+	•	Bootstrap done locally: S3 state bucket + minimal ad-hoc GHA Terraform role created, ARN set as IAM_ROLE on the dev GitHub environment. All subsequent applies run via your{{terraform-deploy.yaml}} workflow, not your laptop.
+	•	VPC + EKS are two custom modules (no off-the-shelf) called from roots/environments/dev/main.tf; all three env roots exist with the same module-call shape.
+	•	The cost guards hold: no NAT Gateway, no public IPv4 on nodes (IPv6-primary, private nodes via Egress-Only IGW), and a*self-managed mixed spot/on-demand ASG sized for platform tools only* — no managed node groups, nothing bigger or more numerous than the EKS-module spec above.
+	•	EKS is IPv6-primary, one version behind latest, with*access entries at CFN* aws-auth parity (SSO Administrator role + your bootstrap GHA role).
+	•	Migration runbook: bootstrap, parallel-run window, validation, cutover, rollback, decommission, before/after IPv4 cost snapshot.
+	•	IPv6 decisions doc (1–2 pp) + a ~15-min teammate walkthrough.
+	•	deploy-platform-tools.yaml filled in to log into your cluster (PR into platform-tools, sequenced with other stories).
+	•	All CFN-cluster workloads migrated with owner ack; CFN stack decommissioned by demo day (no orphans).
+	•	README screenshots: cluster, version, mixed-instance nodes, access-entries list.
+Deliverables
+	1	bootstrap/ module + the runbook section on the local-with-SSO first apply.
+	2	VPC + EKS modules and roots/environments/dev/ wiring (skeleton{{staging/}} + production/), merged to main.
+	3	terraform-deploy.yaml + destroy-on-PR-approval workflows.
+	4	README — overview, architecture diagram (IPv6 / private-subnet / EIGW topology), issues faced, run instructions (incl. the bootstrap dance), screenshots.
+	5	WORKING-WITH-AI.md memoir.
+	6	Migration runbook (see acceptance criteria for contents).
+	7	IPv6 decisions doc (1–2 pp).
+	8	Cutover PR wiring deploy-platform-tools.yaml to your cluster.
+Demo (what you walk the PM through)
+	1	Whiteboard: why migrate from CFN to Terraform on this team specifically — and why IPv6 + private subnets — grounded in this project's constraints (the IPv4 line item), not generic IaC talking points.
+	2	Live: kubectl get nodes on the Terraform cluster — mixed spot/on-demand, multi-AZ, no public IPv4 (private IPv4 + IPv6 only).
+	3	Live: pod IPs are IPv6, and a pod reaches the internet (curl -6 https://api.github.com).
+	4	Live: the EKS access entries, and how they map to the same identities the CFN aws-auth ConfigMap did.
+	5	Walk the runbook: the parallel-run window and why; the validation checks and outcomes; the rollback plan; the before/after IPv4 cost snapshot.
+	6	The deploy-platform-tools.yaml you filled in to log into your cluster, and the PR that merged it, sequenced with other stories.
+	7	The CFN stack no longer exists (aws cloudformation list-stacks ... or the console).
+	8	Anything from the memoir (§3 what Claude got wrong, §4 what I verified) worth surfacing.
+Gotchas & references
+Read Story 1.1 — gotchas before you start, and keep it open while you work. It's a long list on purpose — this is a real migration, and the traps, cross-team coordination points, and doc links in there are most of what separates ""it deployed"" from ""I understood what I shipped."" The more of them you hit and reason through, the better."
+"MRP25CCENT-2","Story","Story 1.2 — Identity & access (cross-work normalization)","[MRP25CCENT-2] Story 1.2 — Identity & access (cross-work normalization) Created: 01/Jun/26  Updated: 03/Jun/26
+Status:
+To Do
+Project:
+MockRealProject - 25C - CentOS
+Fix versions:
+None
+
+Type:
+Story
+Priority:
+Medium
+Reporter:
+Bakhtiyar Shabdanov
+Assignee:
+Unassigned
+Resolution:
+Unresolved
+Votes:
+0
+Labels:
+None
+
+Sprint:
+MRP25CCE Sprint 2
+
+ Description 
+ 
+Epic 1 — Platform Foundation. Cross-work normalization story — touches both other teammates' branches in the infra repo and other teammates' separate app repos.
+
+Working with AI on this project
+Read Working with AI before you start. It is the same for every story and covers: how to direct Claude (and why re-typing what it can generate isn't the skill being graded), the subscription-cap discipline, the standard deliverables (code, README, and the required WORKING-WITH-AI.md memoir), and how the work splits between you and the AI. This ticket only adds the story-specific pieces below.
+
+Story
+Problem statement
+Framing for the team: this story is happening ""as per request from the external Security audit team/contractors."" You are not just shipping IAM — you are answering an audit, and you will defend your design to a stakeholder (your PM) as if they were the audit team.
+You are the team's IAM owner. You have three jobs:
+	1	Build out the team-wide identity layer the scaffold doesn't cover: Developer and DevOps roles for dev and prod accounts, plus the Kubernetes-side access entries that let a developer user have read-only access on the cluster while CI/CD systems have what they need.
+	2	Own the canonical shared GHA Terraform IAM role. Story 1.1 bootstrapped a minimal ad-hoc version to unblock itself; you design the canonical one (tightly-scoped trust + a permission set sized for all the project's Terraform) and submit a consolidation PR into 1.1's branch that swaps theirs for yours.
+	3	Normalize across your teammates' work — both the ad-hoc roles on other infra-repo branches (1.4 Karpenter, 4.1 GitLab runner, …) and the per-app roles app-delivery teammates (3.1 / 3.3 / 3.5) created by hand in the AWS console. Consolidate all of them into one scheme. (Detail in Cross-work normalization below.)
+The normalization is the deliverable, not a side-effect. The interview narrative is ""I worked across five engineers' work — three app repos and two infra-repo branches — to consolidate ad-hoc IAM roles.""
+What you're walking into
+Read the Day-0 scaffold — the key fact for you: the GitHub OIDC provider is the only IAM thing that pre-exists; you build every role. SSO / IdP is coordinator-managed (you don't touch it). Specific to this story:
+	•	From Story 1.1: 1.1's owner bootstrapped a minimal ad-hoc GHA Terraform IAM role (local-with-SSO) whose ARN currently sits in the{{IAM_ROLE}} env var on the dev GitHub environment of{{terraform-infra-<BATCH>-<TEAM>}}. Designing its canonical replacement and PR-ing it into 1.1's branch is your job (below). 1.1's cluster uses EKS access entries (not aws-auth) — coordinate with 1.1 on which roles get K8s access.
+	•	From other infra-repo branches (1.x / 4.x): teammates may have minted their own ad-hoc IAM roles (Karpenter in 1.4, the GitLab runner in 4.1, …). They live on their feature branches. Read them.
+	•	From app-delivery teammates (3.1 / 3.3 / 3.5): each works in a_separate app repo_ and likely created their per-app role manually in the AWS console in week 1; their workflow YAML / GH environment references it by ARN/name. You won't find these in your infra repo — locate them via aws iam list-roles and each app repo's workflows.
+	•	EKS access entries: teammates may add entries manually as they need cluster access. Don't fight it in week 1; normalize during consolidation.
+Your own-branch work
+Build the team-wide identity layer as Terraform managed by GitHub Actions.
+The role spec below is the audit's starting point, not a recipe to type out. You own the design and — more to the point — the why behind every boundary, which you defend to the PM as if to the auditor. Where the spec is explicit it's because the audit requires it; where it's silent, the call is yours.
+AWS IAM:
+Five role classes required:
+	•	DeveloperDevAccessRole — read permissions on all EC2 actions, EKS, and full access to S3.
+	•	DevopsDevAccessRole — full permissions.
+	•	DeveloperProdAccessRole — read permissions on EC2, EKS, and S3.
+	•	DevopsProdAccessRole — full read permissions in Prod (except for secrets) and full permissions on EC2.
+	•	SharedGHATerraformRole (or whatever you name it) — the*canonical shared role GHA assumes* to apply Terraform across the project. Trust policy: OIDC from{{token.actions.githubusercontent.com}}, subject scoped to the team's terraform-infra-<BATCH><TEAM> repo and dev GitHub environment (extendable to platform-tools<BATCH>-<TEAM> if another story needs Terraform there). Permission set: scoped to what all Terraform in the project needs — broader than 1.1's bootstrap role, narrower than AdministratorAccess. This role replaces 1.1's ad-hoc bootstrap role via your cross-work PR.
+The four human/access roles must trust the parent AWS account:879500880845. The shared GHA role uses the OIDC provider, not the parent account. (Per-app GHA roles — ECR push, Secrets Manager read — come out of the cross-work normalization below.)
+Prod environment on this project. Per-team prod accounts don't exist during the final project. Deploy the prod roles into the same dev account but in the roots/environments/production/ root module — with -prod suffixes on names so they don't collide with the dev-root roles. To test creation of prod roles: in your{{feature/}} branch, temporarily flip your workflow's{{ENVIRONMENT_STAGE}} to production so it applies the production root against the dev account. (This works because we have one root per env, each with its own state file — not a shared root with swappable tfvars.)
+Trust policy scoping. Tight: SSO-group → role for human users, OIDC → role for GHA workflows. No * wildcards on the principal account or subject patterns.
+How an SSO user actually assumes one of your roles (the part that's easy to leave implicit and worth getting right):
+IAM Identity Center logs the developer in as an{{AWSReservedSSO_<PermissionSet><hash>}} role under the account's{{aws-reserved/sso.amazonaws.com/<REGION>/}} path. To let _that role assume your DeveloperDevAccessRole, your trust policy needs to reference the SSO role ARN with a wildcard suffix (the _<hash> changes if the permission set is ever recreated):
+{
+  ""Version"": ""2012-10-17"",
+  ""Statement"": [{
+    ""Effect"": ""Allow"",
+    ""Principal"": { ""AWS"": ""arn:aws:iam::879500880845:root"" },
+    ""Action"": ""sts:AssumeRole"",
+    ""Condition"": {
+      ""ArnLike"": {
+        ""aws:PrincipalArn"":
+          ""arn:aws:iam::879500880845:role/aws-reserved/sso.amazonaws.com/us-east-1/AWSReservedSSO_DeveloperBase_*""
+      }
+    }
+  }]
+}
+The matching gate on the SSO side — letting the developer's permission set call sts:AssumeRole against roles in the team's account — is set up by the project coordinator once, scoped to a naming convention (so engineers can self-serve new roles inside the account without going back to the SSO admin every time).
+sts:SetSourceIdentity — include in both the permission set's allow list and your role's trust policy Action array. This lets CloudTrail record the human behind a chained assume-role session, which is what an auditor wants.
+No off-the-shelf modules. MUST NOT use community Terraform modules from GitHub or the Terraform Registry (e.g.terraform-aws-modules/iam/aws). Write your own — the point is to learn IAM, not to wrap someone else's abstraction.
+Defensible boundaries. Beyond the starting-point spec, you own the why: why does a developer get read on S3 but not write? Why does DevOps-Prod exclude secrets? You will defend each boundary in the design doc and the demo.
+Kubernetes-side mapping:
+	•	The cluster's EKS access entries map the DeveloperProdAccessRole IAM role to a Kubernetes group with view permissions cluster-wide and no write permissions.
+	•	Explicitly forbid kubectl exec and access to Kubernetes Secret objects for the developer group. Why both matter:
+	◦	If a developer can kubectl exec into a pod, they can printenv and read whatever credentials the application injected as env vars. That defeats the no-secrets restriction.
+	◦	Direct access to Secret objects (e.g. kubectl get secret -o yaml) leaks the same credentials a different way.
+	•	Use Kubernetes RBAC: ClusterRole + ClusterRoleBinding for precise control. Don't grant via aggregated roles or view defaults without checking — view includes Secret read in some versions.
+	•	DevOps IAM role mapped to a group with broader (but still scoped) access.
+	•	Coordinate with Story 1.1's owner on where exactly this lives in the Terraform code (does access-entries config live in 1.1's cluster module, or in your IAM module that consumes the cluster?).
+	•	Deployment. Your K8s user-role config deploys via the{{deploy-platform-tools.yaml}} workflow in the platform-tools repo — which ships as comments only, so you fill in / append your section. It's a shared file several stories fill in — sequence your merges (see gotchas).
+A design doc (1–2 pages) explaining the role boundaries and why. This is the artifact you defend in your demo.
+Cross-work normalization
+The deliverable that doesn't live on your branch. Same job in two flavors — infra-repo branches vs. separate app repos — run as four phases:
+	1	Observe (late wk 1 → early wk 2). Find every ad-hoc IAM role. Inside the infra repo, diff teammates' branches (git diff main...origin/feature/STORY-1.4-karpenter – '.tf') —*start with 1.1's bootstrap role, the guaranteed first target. Across app repos, find the console-created roles (aws iam list-roles) and the workflow/env that references them. For each: permissions, trust policy, overscoped? duplicated?
+	2	Design (early wk 2). A unified scheme: the canonical{{SharedGHATerraformRole}} (sized for all project Terraform), a small set of parameterised app roles (one per purpose — ECR push, Secrets Manager read — e.g. App-<app><purpose>-Role<env>), and trust templates (SSO ArnLike for humans, OIDC for GHA). Document it in the design doc.
+	3	Ship the cutovers (wk 2 → 3). Infra-repo: a PR into each teammate's feature branch swapping their role for a call to your module. App repos: a small PR pointing the workflow / GH env at the canonical role name (manifests unchanged); once it merges, the owner deletes the manual console role.
+	4	Decommission. Confirm every ad-hoc role — branch and console — is gone (aws iam list-roles); record each in the cutover ledger.
+Acceptance criteria
+	•	Four human/access roles (DeveloperDevAccessRole,DevopsDevAccessRole, DeveloperProdAccessRole,DevopsProdAccessRole) + the canonical SharedGHATerraformRole, all Terraform-managed via GHA, no off-the-shelf IAM modules. Human roles trust 879500880845; the shared role's OIDC trust is scoped tight to the repo + dev.
+	•	Canonical app CI/CD roles exist — a small parameterised set (e.g. ECR push, Secrets Manager read), Terraform-managed, one per app-side purpose. These are what the app repos point at — distinct from SharedGHATerraformRole, which is for Terraform applies.
+	•	Consolidation PR into 1.1's branch swaps the ad-hoc bootstrap role for the canonical one — merged or in review by demo day, with the dev IAM_ROLE env var repointed.
+	•	A cross-work PR into every other source — each infra-repo branch with an ad-hoc role, and each app repo (3.1 / 3.3 / 3.5) pointing its workflow/env at the canonical app role — submitted, merged or in review by demo day.
+	•	Prod roles testable end-to-end (deployed via{{roots/environments/production/}}, -prod-suffixed).
+	•	SSO trust verified end-to-end: a developer assumes{{DeveloperDevAccessRole}} and can do reads but not write/delete; via that role kubectl get pods works but kubectl delete,exec, and get secret are denied.
+	•	Trust policies use the SSO ArnLike pattern (no hard-coded hash) and tightly-scoped OIDC subjects — no * on principal or subject.
+	•	Access-model design doc (≤2 pp) explains the boundaries and the shared role's permission set.
+	•	No orphaned IAM roles after decommission (aws iam list-roles).
+Deliverables
+	1	Terraform code for IAM roles + EKS access entries (your own branch in the infra repo, merged to main).
+	2	README in your story folder.
+	3	WORKING-WITH-AI.md memoir (required — see template).
+	4	Access model design doc (1–2 pages).
+	5	Cross-work cutovers ledger (a markdown file or a section of the README) with two tables:
+	◦	Cross-branch (infra repo): one row per teammate's feature branch you submitted a consolidation PR into, with link + status.
+	◦	Cross-repo (app repos + console): one row per app repo you submitted a workflow/env PR into, with link + status + a note that the manually-created console role was deleted.
+	6	Reusable IAM module/pattern (committed in a location both your code and other infra-repo teammates' code can import from).
+Demo (what you walk the PM through)
+	1	Whiteboard the access model — why these roles and boundaries, including the shared role's permission set. PM will probe.
+	2	Live: SSO-login as a developer — kubectl get pods works,kubectl delete / exec / get secret fail. Show the trust policy that makes it true.
+	3	The consolidation, before/after: 1.1's branch (ad-hoc bootstrap role → canonical SharedGHATerraformRole, IAM_ROLE repointed), and one app repo (manual console-role ARN → canonical role name, then deleted).
+	4	Walk the cross-work cutovers ledger (both tables).
+	5	Anything from the memoir (§3 what Claude got wrong, §4 what I verified) worth surfacing.
+Gotchas & references
+Read Story 1.2 — gotchas before you start, and keep it open while you work. It's a long list on purpose — this is an audit response, and the audit-failure patterns, cross-team coordination points, and doc links in there are most of what separates ""the roles exist"" from ""I can defend this design."" The more of them you hit and reason through, the better."
+"MRP25CCENT-3","Story","Story 1.3 — Traffic plane migration (ingress-nginx → Gateway API)","[MRP25CCENT-3] Story 1.3 — Traffic plane migration (ingress-nginx → Gateway API) Created: 01/Jun/26  Updated: 03/Jun/26
+Status:
+To Do
+Project:
+MockRealProject - 25C - CentOS
+Fix versions:
+None
+
+Type:
+Story
+Priority:
+Medium
+Reporter:
+Bakhtiyar Shabdanov
+Assignee:
+Moses Sarpong
+Resolution:
+Unresolved
+Votes:
+0
+Labels:
+None
+
+Sprint:
+MRP25CCE Sprint 2
+
+ Description 
+ 
+Epic 1 — Platform Foundation. Migration + cross-work normalization story — you swap the team's traffic plane off the Day-0 ingress-nginx onto Gateway API, and submit the per-app Ingress → HTTPRoute cutover PRs into your app-delivery teammates' branches. No single predecessor ticket; it shares the platform-tools deploy conventions used across the platform stories.
+
+Working with AI on this project
+Read Working with AI first — it covers how to work with Claude Code, the subscription cap, and the standard deliverables (including the required WORKING-WITH-AI.md memoir). This ticket only adds the story-specific pieces.
+
+Story
+Problem statement
+Framing for the team: the Day-0 traffic plane is ingress-nginx with classic Ingress resources, installed by hand. It works — your teammates are already serving traffic through it. The decision to migrate is yours to defend: your PM (and a future interviewer) will ask ""*why move off ingress-nginx when it works?"" Have an answer that's about this team, not generic ""Gateway API is the future"" talk.*
+ingress-nginx is in maintenance mode; Gateway API is the modern, role-oriented replacement (the Gateway is owned by you, the platform owner; each HTTPRoute is owned by the app team — which maps exactly to how this team is actually split). Your job is to*migrate the team to Gateway API on the AWS Load Balancer Controller without taking anyone's app down*:
+	1	Install the Gateway API CRDs and the AWS Load Balancer Controller (with Gateway API support enabled), and stand up at least one shared team Gateway. ALBs land in the public, dual-stack, LB-only subnets Story 1.1 built for exactly this.
+	2	Publish HTTPRoute conventions so teammates know how to attach their app to the shared Gateway.
+	3	Submit the per-app cutover PRs (classic Ingress →HTTPRoute) into each K8s app-delivery teammate's feature branch and main, preserving their existing path matchers and backends.
+	4	Decommission ingress-nginx once every app has migrated.
+This is a migration, not a greenfield install. The interview narrative isn't ""I installed an ingress controller"" — it's ""I migrated my team's whole traffic plane off legacy ingress-nginx onto Gateway API + ALB, including the per-app cutover PRs into three engineers' branches."" The migration plan, the conventions doc, and the cutover ledger are the deliverable; the manifests are a sub-deliverable.
+What you're walking into
+Read the Day-0 scaffold every team starts from (repos, empty stubs, OIDC-only IAM, the manual cluster, Terraform conventions, PR rules). Specific to this story:
+	•	What you're migrating off is ingress-nginx with classic{{Ingress}} resources, installed by hand by the coordinator (not via any workflow). It is the only traffic ingress on the cluster today.
+	•	You build on Story 1.1's cluster. It is IPv6-primary (pods get IPv6 addresses), nodes are in private, IPv6-only subnets, and the public subnets are dual-stack and LB-only — they exist_for the load balancers this story creates_. How an ALB front-ends IPv6 pod targets is yours to work out (see gotchas).
+	•	deploy-platform-tools.yaml ships as comments only — it does not point at anything yet. Your CRD install, controller install, and Gateway apply run through the section you fill in. It is a*shared file* — sequence your merge (see gotchas).
+	•	The ALB Controller needs an AWS IAM identity. Nothing pre-exists for it (scaffold ships only the OIDC provider). You mint an ad-hoc role for it on your infra branch; Story 1.2's owner will submit a consolidation PR folding it into the canonical IAM scheme — don't over-build it. Same pattern as 1.1's bootstrap role and 1.4's Karpenter role.
+	•	TLS / HTTPS is not yours. cert-manager (for issued certs), external-dns (Route53 records on your Gateway/HTTPRoutes), and the Secrets Manager CSI driver all live in Story 1.5. Your Gateway is HTTP-only in week 1; the HTTPS listener gets wired up once 1.5's cert-manager ships. Don't hardcode certs or DNS — leave those seams for 1.5's cutover.
+	•	Your app-delivery teammates are a moving target. 3.1 (Versus), 3.3 (Proshop), and 3.5 (Weather backend) are each deploying onto the ingress-nginx scaffold in week 1 with classic Ingress and hardcoded hostnames, and won't pause. 3.2 (Versus on EC2) and 3.4 (serverless) don't touch the cluster's traffic plane — they're not your concern.
+Your own-branch work
+Like the rest of Epic 1, this spans two repos: the controller's AWS identity in terraform-infra-<BATCH><TEAM>, and the traffic-plane manifests + workflow wiring in platform-tools<BATCH>-<TEAM>.
+You own the design. Component versions, controller configuration, how the cluster gets its AWS identity, namespacing, how the ALB reaches your pods — all of that is yours to decide, defend, and troubleshoot. The gotchas flag the traps worth reasoning through; they don't hand you the setup. What's not negotiable:
+	•	Gateway API replaces classic Ingress as the team's traffic plane, on the AWS Load Balancer Controller — ALBs use the public dual-stack subnets Story 1.1 built for exactly this.
+	•	Everything deploys through the deploy-platform-tools.yaml GHA workflow (it ships as comments only — you fill in your section), no manual kubectl/helm from a laptop. It's a shared file — see gotchas for merge sequencing.
+	•	The controller's AWS identity is an ad-hoc IAM role on your infra branch, scoped tight. Story 1.2 consolidates it later — don't over-build it.
+	•	HTTP-only in week 1. TLS, DNS, and secrets are Story 1.5 — don't hand-provision certs or Route53 records; leave those seams for its cutover.
+	•	A published HTTPRoute conventions doc the app teams code against — the hostname / attachment contract and how it maps to the Ingress it replaces. This is the graded artifact, not a how-to.
+Cross-work normalization
+The deliverable that doesn't live on your branch: moving the three K8s app-delivery teammates — 3.1 (Versus), 3.3 (Proshop), 3.5 (Weather backend) — off classic Ingress onto HTTPRoutes on your Gateway. Same four-phase shape 1.2 and 1.5 use:
+	1	Observe. Read each app branch and inventory its Ingress — hostnames, routes, backends, and any ingress-nginx-specific annotations that need a deliberate decision in the new world.
+	2	Design. The HTTPRoute conventions, plus the sequencing — which app goes first and how the two traffic planes coexist during the parallel-run window.
+	3	Ship the cutovers. A PR into each teammate's feature branch (then{{main}}) converting their Ingress → HTTPRoute, preserving their routes and backends. They own the app and review the PR; you own the conversion.
+	4	Decommission. Once every app serves through the Gateway, uninstall ingress-nginx and record each cutover in the ledger.
+Acceptance criteria
+	•	Team traffic serves through Gateway API on the AWS Load Balancer Controller, deployed via the deploy-platform-tools.yaml workflow (merge sequenced with the other platform stories).
+	•	The controller's AWS identity is an ad-hoc Terraform IAM role on your infra branch, expecting 1.2's consolidation PR.
+	•	A real workload is reachable end-to-end through the Gateway (HTTP).
+	•	HTTPRoute conventions doc published.
+	•	Ingress→HTTPRoute cutover PR into each of 3.1 / 3.3 / 3.5 (and main), routes and backends preserved — merged or in review by demo day.
+	•	ingress-nginx decommissioned only after every app has migrated — no orphans.
+	•	Migration plan covering the parallel-run window, rollback, and decommission.
+Deliverables
+	1	Controller IAM role (Terraform, your infra branch).
+	2	Gateway API + controller install and the shared Gateway, in platform-tools, deployed via the workflow.
+	3	README + WORKING-WITH-AI.md memoir.
+	4	Migration plan + HTTPRoute conventions doc.
+	5	Cutover ledger — one row per app branch (3.1 / 3.3 / 3.5) with PR link + status, plus the line confirming ingress-nginx was removed.
+Demo (what you walk the PM through)
+	1	Whiteboard: why move off ingress-nginx on this team — grounded in this team's platform/app split and what the managed-ALB path buys you, not generic ""Gateway API is modern"" talk.
+	2	Live: a real workload reached through the Gateway over HTTP.
+	3	One app's Ingress → HTTPRoute conversion side-by-side (routes + backends preserved), and the cutover ledger.
+	4	The migration plan in action — parallel-run, rollback, and the moment ingress-nginx came out.
+	5	Anything from the memoir (§3 what Claude got wrong, §4 what I verified) worth surfacing.
+Gotchas & references
+Read Story 1.3 — gotchas before you start, and keep it open while you work. It's a long list on purpose — this is a real traffic-plane migration, and the cross-team coordination points, the IPv6/ALB traps, and the Gateway API edge cases in there are most of what separates ""a route resolved"" from ""I understood what I shipped."" The more of them you hit and reason through, the better."
+"MRP25CCENT-4","Story","Story 1.4 — Karpenter & cost lifecycle","[MRP25CCENT-4] Story 1.4 — Karpenter & cost lifecycle Created: 01/Jun/26  Updated: 03/Jun/26
+Status:
+In Progress
+Project:
+MockRealProject - 25C - CentOS
+Fix versions:
+None
+
+Type:
+Story
+Priority:
+Medium
+Reporter:
+Bakhtiyar Shabdanov
+Assignee:
+Ariet
+Resolution:
+Unresolved
+Votes:
+0
+Labels:
+None
+
+Sprint:
+MRP25CCE Sprint 2
+
+ Description 
+ 
+Epic 1 — Platform Foundation. Build + own story — you add demand-driven workload scaling on top of Story 1.1's cluster, and become the team's cost lens against the team's real (small) AWS bill.
+
+Working with AI on this project
+Read Working with AI first — it covers how to work with Claude Code, the subscription cap, and the standard deliverables (including the required WORKING-WITH-AI.md memoir). This ticket only adds the story-specific pieces.
+
+Story
+Problem statement
+Framing for the team: Story 1.1 gave you a small self-managed ASG sized for platform tools only — it was never meant to scale the team's apps. The decision to add Karpenter is yours to defend: your PM (and a future interviewer) will ask ""*why add Karpenter when the ASG already scales?"" Have an answer about this cluster — the platform-baseline vs. workload-scaling split — not generic ""Karpenter is best practice"" talk. You're also the team's cost owner, so expect the second question: ""what is our biggest line item this week, and what would you cut first?""*
+You own two related jobs on this story:
+	1	Scaling. Deploy Karpenter so the cluster provisions nodes on demand for the team's workloads — bin-packing pending pods onto right-sized nodes and removing nodes when they go idle. Story 1.1's ASG stays as the stable home for the platform tools themselves (including Karpenter's own controller); Karpenter scales everything_else_.
+	2	Cost. Be the team's cost lens. Apply a cost-allocation tagging scheme across the team's resources and produce a 1-page cost report against the team's actual AWS bill — attribute the small-but-real spend to tagged components, name the top three spend categories, and recommend the first cut.
+A note on the cost work, so you aim it right: this is not a production workload, so there's no ""production spend trend"" to analyze and no seven-figure savings story to tell. What's real is that the team's dev account does generate a bill every week (your PM is already watching it). The deliverable is the honest version: ""I can read a real AWS bill, attribute small-but-real spend to tagged resources, and say what to cut first."" That's the interview line — not ""I saved the company $1M.""
+The interview narrative for the whole story is ""I owned scaling and cost on a small but real AWS environment — Karpenter for demand-driven nodes, plus a tagged-spend attribution report against the team's actual bill.""
+What you're walking into
+Read the Day-0 scaffold every team starts from (repos, empty stubs, OIDC-only IAM, the manual cluster, Terraform conventions, PR rules). Specific to this story:
+	•	You build on Story 1.1's cluster. It is IPv6-primary (pods get IPv6 addresses), nodes sit in private, IPv6-only subnets with egress via an Egress-Only IGW (no NAT, no public IPv4 on nodes), and the existing capacity is a self-managed mixed spot/on-demand ASG sized for platform tools only — 1.1 explicitly left workload scaling to you. Karpenter's nodes must land in those same private IPv6-only subnets and inherit the same cost guards (see below).
+	•	deploy-platform-tools.yaml ships as comments only — it does not point at anything yet. Your Karpenter install runs through the section_you_ fill in. It is a shared file — sequence your merge (see gotchas).
+	•	Karpenter needs AWS identities. Nothing pre-exists (the scaffold ships only the OIDC provider). You mint ad-hoc roles for it on your infra branch — a controller identity and a node-instance role.Story 1.2's owner will submit a consolidation PR folding the controller role into the canonical IAM scheme — don't over-build it. Same pattern as 1.1's bootstrap role and 1.3's ALB-controller role.
+	•	Node access to the cluster is via EKS access entries, notaws-auth. Karpenter's nodes join the cluster using their node IAM role; in the access-entry world that means an access entry for the node role. Story 1.1 owns the cluster's initial access entries and 1.2 layers more on top — coordinate where the Karpenter node-role entry lives so it isn't dropped (see gotchas).
+	•	The team's apps are a moving target. Your app-delivery teammates (3.x) are deploying workloads onto the cluster; their pending pods are exactly what Karpenter scales for. You don't need them to finish — a test workload demonstrates scaling — but the NodePool you publish is what their pods will actually land on.
+Your own-branch work
+Like the rest of Epic 1, this spans two repos: Karpenter's AWS identities and supporting infra in terraform-infra-<BATCH><TEAM>, and the Karpenter install + node configs in platform-tools<BATCH>-<TEAM>.
+You own the design. Karpenter version, controller identity mechanism (IRSA vs. Pod Identity), NodePool/EC2NodeClass layout, disruption / consolidation policy, how you demo a scale-up — all of that is yours to decide, defend, and troubleshoot. The gotchas flag the traps worth reasoning through; they don't hand you the setup. What's not negotiable:
+	•	Karpenter scales workloads; the 1.1 ASG stays as the platform baseline. Karpenter's own controller (and the other platform tools) run on the stable ASG — Karpenter cannot live only on nodes it might deprovision. Size and target accordingly.
+	•	Everything deploys through the deploy-platform-tools.yaml GHA workflow (Helm chart vendored locally per the platform-tools convention; no manual helm/kubectl from a laptop). It's a shared file — see gotchas for merge sequencing.
+	•	Karpenter's AWS identities are ad-hoc IAM roles on your infra branch, scoped tight. Story 1.2 consolidates the controller role later — don't over-build the trust policy or permissions.
+	•	The cost guards from Story 1.1 carry into every node Karpenter launches — these are line items on the team's real bill, not starting suggestions:
+	◦	No public IPv4 on Karpenter nodes — they launch into the private IPv6-only subnets, egress via the EIGW, same as the ASG.
+	◦	Spot-first capacity — the NodePool prefers spot, with on-demand only as fallback if you allow it at all.
+	◦	Right-sized instance families — constrain the NodePool to small general-purpose families (t3 / equivalent class), not ""any instance type."" An unconstrained NodePool lets Karpenter pick a large expensive node to satisfy one pod.
+	◦	Active consolidation — a disruption policy that bin-packs and removes empty/underutilized nodes. Idle nodes left running is the most common self-inflicted cost line; consolidation is the lever that closes it.
+Cost lens
+The half of this story that isn't a Karpenter install:
+	•	A cost-allocation tagging scheme, applied to the resources you own and activated in billing so spend can be sliced by tag. Activate it early in the story — the timing bites (see gotchas).
+	•	For attribution to cover the whole team, the tag keys have to be shared. Publish the tag schema (the keys and allowed values) as a short convention so teammates tag their resources the same way. This is the one cross-work contract on this story — pin the keys; let each owner apply them to their own resources.
+	•	A 1-page cost report against the team's actual bill: tagged-spend attribution, the top three spend categories, and a recommended first cut with the reasoning. Ground every number in the real bill — no invented production figures.
+Acceptance criteria
+	•	Karpenter deployed via the deploy-platform-tools.yaml workflow (Helm chart vendored locally; merge sequenced with the other platform stories), with its controller running on Story 1.1's stable ASG — not on Karpenter-managed capacity.
+	•	Karpenter's AWS identities are ad-hoc Terraform IAM roles on your infra branch (controller + node role), with the node role wired into the cluster's access entries; the controller role expects 1.2's consolidation PR.
+	•	A pending-pod scaling event provisions a new node via Karpenter, demoed live — and that node lands in a private IPv6-only subnet with no public IPv4, on spot, in a constrained instance family.
+	•	Consolidation works — scaling the workload back down removes the idle node (demoed or shown from Karpenter's logs/events).
+	•	Cost-allocation tagging scheme applied to your resources and activated in billing; the shared tag-key convention published for teammates.
+	•	1-page cost report against the team's actual bill: tagged-spend attribution + top three categories + a recommended first cut.
+	•	README in the karpenter/ directory; WORKING-WITH-AI.md memoir.
+Deliverables
+	1	Karpenter IAM (Terraform, your infra branch) — controller role + node-instance role, plus any supporting infra Karpenter needs (e.g. the spot-interruption queue), and the node-role access entry.
+	2	Karpenter install + node configs in platform-tools — vendored Helm chart, EC2NodeClass + NodePool, deployed via the workflow.
+	3	README (in karpenter/) + WORKING-WITH-AI.md memoir.
+	4	Tagging convention — the shared tag-key schema teammates code against.
+	5	Cost report (1 page) — tagged-spend attribution + top 3 spend categories + recommended first cut.
+Demo (what you walk the PM through)
+	1	Whiteboard: why Karpenter on this team — the platform-baseline ASG vs. workload-scaling split — grounded in this cluster, not generic autoscaling talk.
+	2	Live: apply a workload that doesn't fit current capacity; a new node is provisioned by Karpenter — show it's spot, private, no public IPv4, in the constrained family.
+	3	Live: scale the workload down; Karpenter consolidates and the idle node goes away.
+	4	The cost report: the tagging scheme, the top three spend categories on the real bill, and the first cut you'd make — defend it.
+	5	Anything from the memoir (§3 what Claude got wrong, §4 what I verified) worth surfacing.
+Gotchas & references
+Read Story 1.4 — gotchas before you start, and keep it open while you work. It's a long list on purpose — Karpenter on an IPv6-primary, self-managed cluster is not the default-tutorial happy path, and the API-version traps, the controller-can't-run-on-its-own-nodes rule, the access-entry coordination, and the cost-tagging timing in there are most of what separates ""a node appeared"" from ""I understood what I shipped."" The more of them you hit and reason through, the better."
+"MRP25CCENT-5","Story","Story 1.5 — Cluster services (cert-manager, external-dns, Secrets Manager CSI)","[MRP25CCENT-5] Story 1.5 — Cluster services (cert-manager, external-dns, Secrets Manager CSI) Created: 01/Jun/26  Updated: 03/Jun/26
+Status:
+To Do
+Project:
+MockRealProject - 25C - CentOS
+Fix versions:
+None
+
+Type:
+Story
+Priority:
+Medium
+Reporter:
+Bakhtiyar Shabdanov
+Assignee:
+Unassigned
+Resolution:
+Unresolved
+Votes:
+0
+Labels:
+None
+
+Sprint:
+MRP25CCE Sprint 2
+
+ Description 
+ 
+Epic 1 — Platform Foundation. Cross-work normalization story — you install and own the three shared cluster services every app-delivery teammate depends on (TLS, DNS, secret injection), and submit the per-app cutover PRs moving them off manual certs, hardcoded hostnames, and plain K8s Secrets onto the shared layer.
+
+Working with AI on this project
+Read Working with AI first — it covers how to work with Claude Code, the subscription cap, and the standard deliverables (including the required WORKING-WITH-AI.md memoir). This ticket only adds the story-specific pieces.
+
+Story
+Problem statement
+Framing for the team: in week 1 every app-delivery teammate did the expedient thing to get unblocked — hardcoded a hostname, dropped their config into a plain Kubernetes Secret they kubectl apply'd by hand, and served HTTP-only (or hand-issued a cert). It works. The decision to centralize is yours to defend: your PM (and a future interviewer) will ask ""*why not let each app team manage their own cert, DNS, and secrets?"" Have an answer about this team — five engineers each hand-rolling TLS, Route53 records, and secret rotation is five places for drift, expiry, and leaked credentials, with no shared rotation story — not generic ""you should automate this"" talk.*
+You own the three shared cluster services that every other team member's app depends on, and the job is to make the app teams declare intent (an annotation, a CRD) instead of hand-provisioning infrastructure:
+	1	cert-manager — TLS automation. Stand it up, configure at least one ClusterIssuer, and wire the HTTPS listener onto Story 1.3's Gateway (1.3 deliberately left it HTTP-only for you).
+	2	external-dns — Route53 record automation against the team's hosted zone, with sources covering 1.3's Gateway / HTTPRoute objects so a route gets its DNS record without anyone touching the console.
+	3	AWS Secrets Manager CSI driver — secret injection into pods via{{SecretProviderClass}}, so app config comes from Secrets Manager instead of a plain K8s Secret checked into a branch.
+Then read the app-delivery teammates' branches and submit the cutover PRs converting them onto the shared layer. This is a cross-work normalization, not a greenfield install. The interview narrative isn't_""I installed cert-manager""_ — it's ""I owned the shared cluster services layer and migrated five engineers' apps off manual cert/DNS/secret patterns onto it, with PRs into each of their branches."" The conventions doc and the cutover ledger are the deliverable; the manifests are a sub-deliverable.
+What you're walking into
+Read the Day-0 scaffold every team starts from (repos, empty stubs, OIDC-only IAM, the manual cluster, Terraform conventions, PR rules). Specific to this story:
+	•	You build on Story 1.1's cluster and Story 1.3's traffic plane. The cluster is IPv6-primary (pods get IPv6 addresses, nodes sit in private, IPv6-only subnets, public subnets are dual-stack and LB-only). 1.3 stood up Gateway API on the AWS Load Balancer Controller and left the Gateway HTTP-only in week 1 — completing the HTTPS listener is your job once cert-manager ships. external-dns watches 1.3's Gateway/HTTPRoute objects, so 1.3's published conventions constrain how your external-dns sources are configured — coordinate with 1.3's owner.
+	•	The team's Route53 hosted zone exists (coordinator-delegated; the scaffold does not give you a registrar). external-dns and cert-manager (if you choose DNS-01) both write/read it — scope them to_this team's_ zone only, and set an ownership registry so you don't clobber records (see gotchas).
+	•	deploy-platform-tools.yaml ships as comments only — it does not point at anything yet. Your three component installs run through the section you fill in. It is a shared file — sequence your merge (see gotchas).
+	•	Each service needs an AWS identity. Nothing pre-exists (the scaffold ships only the OIDC provider). cert-manager needs Route53 access for DNS-01 (if you go that way); external-dns needs Route53 write; the CSI driver's consumers need Secrets Manager read scoped to the secrets they mount. You mint ad-hoc roles for these on your infra branch; Story 1.2's owner will submit a consolidation PR folding them into the canonical IAM scheme — don't over-build them. Same pattern as 1.1's bootstrap role, 1.3's ALB-controller role, and 1.4's Karpenter role.
+	•	Your app-delivery teammates are a moving target. 3.1 (Versus), 3.3 (Proshop), and 3.5 (Weather backend) are each on the cluster, shipping in week 1 with hardcoded hostnames, plain K8s {{Secret}}s, and HTTP-only / hand-issued certs, and won't pause. 3.2 (Versus on EC2) and 3.4 (serverless) don't run on the cluster — they're not your concern.
+Your own-branch work
+Like the rest of Epic 1, this spans two repos: the services' AWS identities in terraform-infra-<BATCH><TEAM>, and the cluster-services manifests + workflow wiring in{{platform-tools<BATCH>-<TEAM>}}.
+You own the design. Component versions, the issuer choice (Let's Encrypt vs. wildcard; HTTP-01 vs. DNS-01), the external-dns source and ownership configuration, the CSI provider config and how each app's service account gets its AWS identity, namespacing — all of that is yours to decide, defend, and troubleshoot. The gotchas flag the traps worth reasoning through; they don't hand you the setup. What's not negotiable:
+	•	All three services deploy through the deploy-platform-tools.yaml GHA workflow (Helm charts vendored locally per the platform-tools convention; no manual helm/kubectl from a laptop). It's a*shared file* — see gotchas for merge sequencing.
+	•	The services' AWS identities are ad-hoc IAM roles on your infra branch, scoped tight. Story 1.2 consolidates them later — don't over-build the trust policies or permission sets.
+	•	The HTTPS listener completes 1.3's Gateway, it doesn't replace it. Amend the existing Gateway with a TLS listener fed by a cert-manager-issued certificate — don't stand up a parallel one. Coordinate the merge so you're not racing 1.3's owner on the same object.
+	•	A published conventions doc the app teams code against — how a teammate requests a cert, a DNS record, and a secret (the annotations / CRDs and what they map to). This is the graded artifact, not a how-to.
+Cross-work normalization
+The deliverable that doesn't live on your branch: moving the three K8s app-delivery teammates — 3.1 (Versus), 3.3 (Proshop), 3.5 (Weather backend) — off manual cert/DNS/secret patterns onto the shared layer. Same four-phase shape 1.2 and 1.3 use:
+	1	Observe. Read each app branch and inventory what to convert — the hardcoded hostname(s), every plain K8s Secret, and how the app does (or doesn't) get TLS today.
+	2	Design. The conventions (cert/DNS/secret request patterns), plus the sequencing — which app goes first and how an app keeps serving during its own cutover.
+	3	Ship the cutovers. A PR into each teammate's feature branch (then{{main}}) converting hardcoded hostname → external-dns annotation,plain Secret → SecretProviderClass, and manual/HTTP cert → cert-manager-issued cert — preserving the app's behaviour (it must still read the same config and serve the same routes). They own the app and review the PR; you own the conversion.
+	4	Verify & close. Confirm no app team's main still carries a hardcoded cert, hardcoded DNS, or plain K8s Secret, and record each cutover in the ledger.
+Acceptance criteria
+	•	cert-manager deployed via the deploy-platform-tools.yaml workflow with at least one ClusterIssuer, and the HTTPS listener on 1.3's Gateway served by a cert-manager-issued certificate (real workload reachable over HTTPS).
+	•	external-dns deployed against the team's Route53 zone, with*Gateway / HTTPRoute sources* (works with 1.3's setup) and an ownership registry; a route's DNS record is created automatically.
+	•	AWS Secrets Manager CSI driver + provider deployed; a test pod mounts a secret from Secrets Manager via a{{SecretProviderClass}}.
+	•	Each service's AWS identity is an ad-hoc Terraform IAM role on your infra branch, scoped tight, expecting 1.2's consolidation PR.
+	•	Conventions doc published: how to request a cert, a DNS record, and a secret.
+	•	Cutover PR into each of 3.1 / 3.3 / 3.5 (and main) — hostname → external-dns, plain Secret → SecretProviderClass, manual/HTTP cert → cert-manager — app behaviour preserved, merged or in review by demo day.
+	•	No app team's main still carries a hardcoded cert, hardcoded DNS record, or plain K8s Secret for config.
+Deliverables
+	1	Cluster-services IAM (Terraform, your infra branch) — the ad-hoc roles for cert-manager (if DNS-01), external-dns, and the CSI driver's secret consumers.
+	2	Three component installs in platform-tools — vendored Helm charts, the ClusterIssuer, the external-dns config, the CSI driver + provider, deployed via the workflow; plus the TLS listener amendment on 1.3's Gateway.
+	3	README + WORKING-WITH-AI.md memoir.
+	4	Conventions doc — how to request a cert / DNS record / secret.
+	5	Cutover ledger — one row per app branch (3.1 / 3.3 / 3.5) with PR link + status, confirming hostname, secret, and cert were each migrated.
+Demo (what you walk the PM through)
+	1	Whiteboard: why centralize cert/DNS/secrets on this team — the drift / expiry / leaked-credential cost of five engineers hand-rolling it, not generic ""automate everything"" talk.
+	2	Live: a real workload reached over HTTPS through 1.3's Gateway, with a cert-manager-issued certificate and a Route53 record external-dns created.
+	3	Live: a pod mounting a secret from Secrets Manager via{{SecretProviderClass}} — and the plain Secret it replaced, gone.
+	4	One app's cutover PR side-by-side (hostname / secret / cert before and after), and the cutover ledger.
+	5	Anything from the memoir (§3 what Claude got wrong, §4 what I verified) worth surfacing.
+Gotchas & references
+Read Story 1.5 — gotchas before you start, and keep it open while you work. It's a long list on purpose — three controllers that each touch AWS, an IPv6-primary cluster, the HTTPS-listener handoff from 1.3, and a per-app secret cutover that can silently change how an app reads its config: the ACME-challenge choice, the external-dns ownership trap, the CSI-driver mount-vs-env gotcha, and the cross-team coordination points in there are most of what separates ""a cert issued"" from ""I understood what I shipped."" The more of them you hit and reason through, the better."
+"MRP25CCENT-6","Story","Story 2.1 — Metrics & SLOs","[MRP25CCENT-6] Story 2.1 — Metrics & SLOs Created: 01/Jun/26  Updated: 04/Jun/26
+Status:
+In Progress
+Project:
+MockRealProject - 25C - CentOS
+Fix versions:
+None
+
+Type:
+Story
+Priority:
+Medium
+Reporter:
+Bakhtiyar Shabdanov
+Assignee:
+Yuriy Horyachok
+Resolution:
+Unresolved
+Votes:
+0
+Labels:
+None
+
+Sprint:
+MRP25CCE Sprint 2
+
+ Description 
+ 
+Epic 2 — Observability. Build + own story — you stand up the team's metrics stack and define the SLO that becomes the contract between platform and product.
+
+Working with AI on this project
+Read Working with AI first — it covers how to work with Claude Code, the subscription cap, and the standard deliverables (including the required WORKING-WITH-AI.md memoir). This ticket only adds the story-specific pieces.
+
+Story
+Problem statement
+Framing for the team: the company used to pay for Datadog. The decision to replace it with open-source tooling (Prometheus + Grafana) was made to cut cost — and your PM (and a future interviewer) will ask ""*what did we gain and what did we give up by leaving a managed product for tools we run ourselves?"" The second question this story exists to make you answer is harder: ""you have a dashboard full of green graphs — so what number actually tells you whether the platform is doing its job?"" That number is the SLO, and defending it is the graded skill.*
+You are the team's metrics owner. Your job is to stand up the metrics stack the rest of the team observes the platform through, and to define*at least one service-level objective* for a platform-deployed app that the team treats as a real contract. Concretely:
+	1	Metrics stack — Prometheus + Grafana on the team's EKS cluster, with Alertmanager alongside (Story 2.3 layers its alert rules and routing onto your Alertmanager — see What you're walking into).
+	2	Two sources, one pane — Prometheus scrapes the cluster and at least one teammate's app; Grafana also reads CloudWatch so the AWS-managed pieces (databases, load balancers) show up next to the cluster metrics.
+	3	Dashboards — published as code, reachable at the team's Grafana hostname, and explainable by you panel by panel.
+	4	An SLO — one app's key user journey, with a target, a measurement window, an error budget, and a written rule for what happens when the budget burns.
+The interview narrative is ""I owned the metrics stack — and defined the SLO that the team treated as the contract between platform and product."" The stack is the table stakes; the SLO is the story.
+What you're walking into
+Read the Day-0 scaffold every team starts from (repos, empty stubs, OIDC-only IAM, the manual cluster, Terraform conventions, PR rules). Specific to this story:
+	•	Your stack lives in eks-monitoring/ in the platform-tools repo, and you own it. You also own the eks-monitoring section of the shared{{deploy-platform-tools.yaml}} workflow (it ships as comments only — sequenced with the other stories that touch that file; see gotchas).
+	•	Story 2.3 is your main downstream. Your Alertmanager is a shared seam — 2.3 adds its alert rules and Slack routing onto yours rather than deploying its own. Deploy Alertmanager with your stack and settle the shared-config ownership with 2.3's owner (see gotchas).
+	•	Story 1.1 is your upstream cluster. The platform-tools workflow deploys onto whatever cluster it logs into; coordinate with 1.1's CFN→Terraform migration so your stack lands on (and moves with) the right cluster.
+	•	The app you scrape belongs to a teammate. The K8s app-delivery stories (3.1 Versus, 3.3 Proshop, 3.5 Weather backend) appear over the course of the project. Pick one, coordinate a scrape target with its owner, and don't block on it — scrape the cluster itself meanwhile (see gotchas).
+	•	CloudWatch-in-Grafana needs an IAM role you mint on your branch (ad-hoc; Story 1.2 consolidates it later — see gotchas).
+	•	How Grafana is exposed follows the traffic plane as it evolves — the scaffold's ingress-nginx in week 1, Gateway API once 1.3 publishes its HTTPRoute conventions, HTTPS once 1.5's cert-manager lands. Adopt the current convention rather than hardcoding a permanent one.
+Your work
+This story is platform-tools work plus an SLO doc: the Prometheus + Grafana + Alertmanager stack as a locally-vendored Helm chart under{{eks-monitoring/}}, deployed via the deploy-platform-tools.yaml workflow, with per-env values (dev / staging / production) even though only{{dev}} is exercised.
+You own the design — what the chart looks like, retention and storage sizing, which dashboards you build, what you scrape, and — above all — the SLO itself. The gotchas flag the traps worth reasoning through; they don't hand you the setup. What's not negotiable:
+	•	Vendor a local chart; don't pull a public chart at deploy time. Same Helm-from-local-charts convention the other platform-tools stories follow — the chart you deploy is yours and adjustable. (You may adapt community templates and dashboards into it; you may not depend on an upstream chart you can't explain — see gotchas.)
+	•	Alertmanager ships with the stack and is the seam 2.3 builds on — deploy it even if your own alerting rules are minimal, and sequence the shared config with 2.3's owner.
+	•	Grafana is reachable at grafana-<TEAM>dev.<TEAM_DOMAIN> (e.g.grafana-centos-dev.312centos.com), with the staging/prod hostnames (grafana<TEAM>staging.<TEAM_DOMAIN>,grafana<TEAM>-prod.<TEAM_DOMAIN>) defined in their values files even though those environments aren't deployed.
+	•	Grafana is not open to the whole internet. Restrict access to an allowlisted source IP (use your home public IP for the demo — there's no company VPN with a dedicated IP), and require authentication. Grafana credentials live in AWS Secrets Manager, never committed (week-1 manual secret is fine; the clean injection path is 1.5's Secrets Manager CSI driver once it lands).
+	•	At least one SLO is defined, measured, and defensible — one app's key user journey, with a target, a measurement window, an error budget, and a written response when the budget burns. You choose the SLI and the target and defend them; this is the deliverable interviewers care about, and the one part Claude must not pick for you.
+Acceptance criteria
+	•	Prometheus + Grafana + Alertmanager deployed on the cluster as a*locally-vendored Helm chart* under eks-monitoring/, via the{{deploy-platform-tools.yaml}} workflow (your section sequenced with the other stories that touch that file), with dev/staging/prod values present.
+	•	Prometheus scrapes the cluster and at least one app — ServiceMonitors / scrape configs for cluster components plus one teammate's app (coordinated with its owner).
+	•	Grafana reads CloudWatch too — the CloudWatch data source is wired (via an ad-hoc IAM role on your branch) so AWS-managed resources show alongside cluster metrics in the same Grafana.
+	•	Dashboards published as code (provisioned from the chart, not hand-clicked in the UI) and reachable at{{grafana-<TEAM>-dev.<TEAM_DOMAIN>}}.
+	•	Grafana is access-restricted — auth on, reachable only from an allowlisted source IP, admin credentials sourced from Secrets Manager and not committed.
+	•	One SLO written down — SLI, target, measurement window, error budget, and the response when the budget is burned — and measured against traffic (synthetic is fine if you say so) so the dashboard shows it tracking.
+	•	README in eks-monitoring/ (overview, architecture, how to reach Grafana, how the SLO is computed) + WORKING-WITH-AI.md memoir.
+Deliverables
+	1	Metrics stack — the locally-vendored Helm chart (Prometheus + Grafana + Alertmanager) under eks-monitoring/, with per-env values.
+	2	Scrape config — cluster + at least one app (ServiceMonitors / scrape configs).
+	3	CloudWatch data source in Grafana + the ad-hoc IAM role behind it.
+	4	Dashboards as code — provisioned from the chart, including the SLO panel.
+	5	SLO doc — SLI, target, rationale, measurement window, error budget, and what triggers a response when it burns.
+	6	Cutover PR wiring the eks-monitoring section of{{deploy-platform-tools.yaml}}.
+	7	README + WORKING-WITH-AI.md memoir.
+Demo (what you walk the PM through)
+	1	Whiteboard: why open-source metrics instead of Datadog on this team specifically — what you gained, what you gave up — and then the SLO: the journey you chose, the target, and why that number.
+	2	Live: Grafana at grafana-<TEAM>-dev.<TEAM_DOMAIN> — show a panel fed by Prometheus and one fed by CloudWatch in the same dashboard.
+	3	Live: the access restriction — Grafana is reachable from your allowlisted IP and requires login (and not from elsewhere).
+	4	Live: the SLO panel tracking against traffic, the error budget remaining, and where the line would have to go for you to act.
+	5	Show the Alertmanager you deployed and explain how 2.3's rules layer onto it (the shared-seam handoff).
+	6	Anything from the memoir (§3 what Claude got wrong, §4 what I verified) worth surfacing.
+Gotchas & references
+Read Story 2.1 — gotchas before you start, and keep it open while you work. It's a long list on purpose — a metrics stack that ""comes up"" is the easy 20%; the judgment (what's worth scraping, how the SLO is defined, what the dashboards actually tell you) and the cross-team seams (the shared Alertmanager, the shared workflow file, the IPv6-only pods) are most of what separates ""Grafana is green"" from ""I built observability the team could run on."" The more of them you hit and reason through, the better."
+"MRP25CCENT-7","Story","Story 2.2 — Logs + diagnostic skill","[MRP25CCENT-7] Story 2.2 — Logs + diagnostic skill Created: 01/Jun/26  Updated: 03/Jun/26
+Status:
+To Do
+Project:
+MockRealProject - 25C - CentOS
+Fix versions:
+None
+
+Type:
+Story
+Priority:
+Medium
+Reporter:
+Bakhtiyar Shabdanov
+Assignee:
+Richard Bonsu
+Resolution:
+Unresolved
+Votes:
+0
+Labels:
+None
+
+Sprint:
+MRP25CCE Sprint 2
+
+ Description 
+ 
+Epic 2 — Observability. Build + own story — you stand up the team's logging stack and build the Claude skill that turns ""go grep through Kibana for 20 minutes"" into ""run one command and read the AI's hypothesis.""
+
+Working with AI on this project
+Read Working with AI first — it covers how to work with Claude Code, the subscription cap, and the standard deliverables (including the required WORKING-WITH-AI.md memoir). This ticket only adds the story-specific pieces.
+
+Story
+Problem statement
+Framing for the team: the company is moving off a traditional/managed logging system onto an open-source stack (EFK — Elasticsearch, Fluentd, Kibana) to cut cost. Your PM (and a future interviewer) will ask ""*what did we gain and what did we give up running our own logging stack instead of paying for a managed one — and how do we make sure we lost no logging capability in the move?"" The second question this story exists to make you answer is the one that didn't exist 18 months ago: ""it's 2am, a service is misbehaving, and there are gigabytes of logs — can you turn the 20-minute Kibana grep into one command that hands you a hypothesis?"" That command is the diagnostic skill, and designing it — including what it's allowed to touch — is the graded skill.*
+You are the team's logging owner. Your job is to stand up the stack the rest of the team reads logs through, make it survivable (a redundant backup), and build a Claude Code skill that does the first pass of a log investigation for you. Concretely:
+	1	Logging stack — Elasticsearch + Fluentd + Kibana on the team's EKS cluster, collecting logs from every platform service.
+	2	Redundant backup — Fluentd ships logs to both Elasticsearch*and* Amazon S3, so a lost or corrupted Elasticsearch index isn't a lost log. (This was a ""bonus"" in the old world; here it's the point — a single log store is a single point of failure.)
+	3	Kibana — reachable at the team's Kibana hostname, authenticated, and access-restricted; explainable by you.
+	4	A diagnostic skill — a Claude Code skill in the team's{{.claude/skills/}} that, given a time range and a service name, fetches the recent logs, summarises the patterns, and proposes a hypothesis — with an autonomy boundary you decided and can defend.
+The interview narrative is ""I built the team's logging stack — and the Claude skill that turned 'go grep through Kibana for 20 minutes' into 'run one command and read the AI's hypothesis.'"" The stack is table stakes; the skill is the story.
+What you're walking into
+Read the Day-0 scaffold every team starts from (repos, empty stubs, OIDC-only IAM, the manual cluster, Terraform conventions, PR rules). Specific to this story:
+	•	Your stack lives in eks-logging/ in the platform-tools repo, and you own it. You also own the eks-logging section of the shared{{deploy-platform-tools.yaml}} workflow (it ships as comments only — sequenced with the other stories that touch that file; see gotchas).
+	•	Story 1.1 is your upstream cluster. The platform-tools workflow deploys onto whatever cluster it logs into; coordinate with 1.1's CFN→Terraform migration so your stack lands on (and moves with) the right cluster.
+	•	The logs you collect belong to the whole team. Once the K8s app-delivery stories (3.1 Versus, 3.3 Proshop, 3.5 Weather backend) land, their pods' logs flow into your stack too — your skill is more useful the more real services it can read. You are not blocked waiting on them: cluster components and your own induced-failure pods give you real logs from week 1.
+	•	Fluentd writing to S3 needs an IAM role you mint on your branch (ad-hoc; Story 1.2 consolidates it later — see gotchas). So does the skill, if you give it AWS read access (see the autonomy gotcha).
+	•	How Kibana is exposed follows the traffic plane as it evolves — the scaffold's ingress-nginx in week 1, Gateway API once 1.3 publishes its HTTPRoute conventions, HTTPS once 1.5's cert-manager lands. Adopt the current convention rather than hardcoding a permanent one.
+	•	Stories 2.1 (metrics) and 2.3 (alerting) are your siblings in the observability epic — logs are the third pillar. 2.3's runbooks will tell on-call to ""check the logs""; your skill is what makes that fast. Light coordination, no hard dependency.
+Your work
+This story is platform-tools work plus a Claude skill: the EFK stack as a*locally-vendored Helm chart* (or charts) under eks-logging/, deployed via the deploy-platform-tools.yaml workflow, with per-env values (dev / staging / production) even though only dev is exercised — plus the diagnostic skill committed to the team's .claude/skills/.
+You own the design — the chart shape, Elasticsearch topology and sizing, retention policy, what Fluentd parses and how, and — above all — what the skill does and how much it's trusted to do. The gotchas flag the traps worth reasoning through; they don't hand you the setup. What's*not* negotiable:
+	•	The stack is EFK — Elasticsearch, Fluentd, Kibana. The team gets one logging stack; this is it. (Fluent Bit is an acceptable modern stand-in for the F — see gotchas — as long as it ships to both destinations below.)
+	•	Vendor a local chart; don't pull a public chart at deploy time. Same Helm-from-local-charts convention the other platform-tools stories follow — the chart you deploy is yours and adjustable. (You may adapt community charts/templates into it; you may not depend on an upstream chart you can't explain — see gotchas.)
+	•	Logs go to two places. Fluentd ships every platform service's logs to Elasticsearch and to Amazon S3 for redundancy, and you prove the S3 copy is real by retrieving a sample log from it (a write path you never read back is not a backup).
+	•	Kibana is reachable at kibana-<TEAM>-dev.<TEAM_DOMAIN> (e.g.kibana-centos-dev.312centos.com), with the staging/prod hostnames defined in their values files even though those environments aren't deployed.
+	•	Kibana is not open to the whole internet. Restrict access to an allowlisted source IP (use your home public IP for the demo — there's no company VPN with a dedicated IP), and require authentication. Kibana / Elasticsearch credentials live in AWS Secrets Manager, never committed (week-1 manual secret is fine; the clean injection path is 1.5's Secrets Manager CSI driver once it lands).
+	•	The diagnostic skill is read-first, and its autonomy boundary is a deliberate, written decision. It takes a time range and a service name, pulls the matching logs, summarises the patterns, and proposes a hypothesis. You decide what it may do beyond reading — and you default to read-only unless you can defend more. ""Can it kubectl delete a crash-looping pod? Restart a deployment? Only read?"" is the design question you own and demo against, not a default Claude picks. This is the deliverable interviewers care about.
+Acceptance criteria
+	•	Elasticsearch + Fluentd + Kibana deployed on the cluster as a*locally-vendored Helm chart* under eks-logging/, via the{{deploy-platform-tools.yaml}} workflow (your section sequenced with the other stories that touch that file), with dev/staging/prod values present.
+	•	Logs from every platform service are searchable in Kibana — cluster components in week 1, teammates' apps as they land.
+	•	Fluentd ships to both Elasticsearch and S3 (via an ad-hoc IAM role on your branch), and the S3 redundancy is verified by retrieving a sample log from the bucket — not just configured.
+	•	Kibana is reachable at kibana-<TEAM>-dev.<TEAM_DOMAIN>,auth on, reachable only from an allowlisted source IP, admin credentials sourced from Secrets Manager and not committed.
+	•	Diagnostic skill committed to the team's .claude/skills/ — takes a time range + service name, fetches and summarises logs, proposes a hypothesis; its permission/autonomy boundary is written down and matches what it can actually do.
+	•	Skill demoed against ≥2 log-anomaly scenarios you construct yourself (e.g. a crash-looping pod, an error-rate spike from a bad config) — the skill reaches a useful hypothesis on each.
+	•	README in eks-logging/ (overview, architecture, how to reach Kibana, why EFK over a managed/traditional stack, how the S3 backup works) + WORKING-WITH-AI.md memoir.
+Deliverables
+	1	Logging stack — the locally-vendored Helm chart(s) (Elasticsearch + Fluentd + Kibana) under eks-logging/, with per-env values.
+	2	Fluentd config — collecting platform-service logs, parsing them, and fanning out to both Elasticsearch and S3.
+	3	S3 backup — the bucket + the ad-hoc IAM role behind Fluentd's write path, with a demonstrated retrieval of a sample log.
+	4	The diagnostic skill — committed to the team's .claude/skills/, plus the autonomy-decision note (what it may do without a human, and why) and the ≥2 scenario constructions you demo it against.
+	5	Cutover PR wiring the eks-logging section of{{deploy-platform-tools.yaml}}.
+	6	README + WORKING-WITH-AI.md memoir.
+Demo (what you walk the PM through)
+	1	Whiteboard: why open-source EFK instead of a managed/traditional logging product on this team specifically — what you gained, what you gave up, and how you ensured no log capability was lost.
+	2	Live: Kibana at kibana-<TEAM>-dev.<TEAM_DOMAIN> — search a real log line from a platform service.
+	3	Live: the access restriction — Kibana is reachable from your allowlisted IP and requires login (and not from elsewhere).
+	4	Live: retrieve a sample log out of the S3 backup to prove the redundant copy exists.
+	5	Live: run the diagnostic skill against the two anomaly scenarios you built — show the logs it pulled, the summary, and the hypothesis — then walk through what it is and isn't allowed to do and why you drew the line there.
+	6	Anything from the memoir (§3 what Claude got wrong, §4 what I verified) worth surfacing.
+Gotchas & references
+Read Story 2.2 — gotchas before you start, and keep it open while you work. It's a long list on purpose — an EFK stack that ""comes up"" is the easy 20%; running Elasticsearch as a stateful workload, keeping the bill bounded, and (above all) designing a skill that gives a useful, trustworthy hypothesis rather than a confident wrong one are where the learning is. The more of them you hit and reason through, the better."
+"MRP25CCENT-8","Story","Story 2.3 — Alerting & on-call","[MRP25CCENT-8] Story 2.3 — Alerting & on-call Created: 01/Jun/26  Updated: 03/Jun/26
+Status:
+To Do
+Project:
+MockRealProject - 25C - CentOS
+Fix versions:
+None
+
+Type:
+Story
+Priority:
+Medium
+Reporter:
+Bakhtiyar Shabdanov
+Assignee:
+Unassigned
+Resolution:
+Unresolved
+Votes:
+0
+Labels:
+None
+
+Sprint:
+MRP25CCE Sprint 2
+
+ Description 
+ 
+Epic 2 — Observability. Build + own story — you make the platform page a human when it breaks, and you write the runbooks the on-call person will need, across both the AWS and Kubernetes layers.
+
+Working with AI on this project
+Read Working with AI first — it covers how to work with Claude Code, the subscription cap, and the standard deliverables (including the required WORKING-WITH-AI.md memoir). This ticket only adds the story-specific pieces.
+
+Story
+Problem statement
+Framing for the team: metrics tell you the platform is sick; an alert wakes someone up to fix it. The hard part of this story isn't wiring CloudWatch to Slack — it's judgment. Your PM (and a future interviewer) will ask the two questions this story exists to make you answer: ""*what would you page a human for at 3am, and what would you leave on a dashboard for the morning?"" and ""an alert fired but nothing was actually wrong — what do you change?"" Have answers grounded in this platform.*
+You are the team's alerting and on-call lead. Your job is to make the platform notify a human when something is actually wrong — across both layers it runs on — and to write the runbooks the person who gets paged will follow. Concretely:
+	1	AWS-level alerting — CloudWatch alarms on the platform's AWS-managed pieces (the app databases and whatever else you decide matters).
+	2	Kubernetes-level alerting — alert rules on the cluster and its workloads (crash loops, pods that won't go Ready, node pressure, and the like).
+	3	Routing & tuning — everything lands in the team's shared Slack channel, tuned so a single incident is one useful message, not forty.
+	4	Runbooks + an alert-vs-noise policy — the artifacts the on-call person (and your interviewer) actually care about.
+There is no fixed list of alerts in this ticket, on purpose. Picking_what_ to alert on — and, just as important, what not to alert on — is the graded skill. Research the real failure modes of each layer and choose a set you can defend. Categories worth investigating (a prompt for your research, not a checklist to implement): database health (CPU, connections, free storage, replica lag); workload health (crash loops, restart counts, OOMKills, unavailable replicas, failed deployments); node/cluster health (NotReady nodes, disk/memory pressure); and ingress health (target-group unhealthy hosts, 5xx rate, latency) once 1.3's ALB is in place. Every alert you keep must earn its place against your own alert-vs-noise policy — and you should be able to name something you deliberately left as a dashboard metric instead.
+The interview narrative is ""I was the team's alerting and on-call lead — I designed what we'd page on across AWS and Kubernetes, wrote the runbooks, and tuned the alerts so my teammates didn't drown in noise.""
+What you're walking into
+Read the Day-0 scaffold every team starts from (repos, empty stubs, OIDC-only IAM, the manual cluster, Terraform conventions, PR rules). Specific to this story:
+	•	Story 2.1 is your main upstream. It stands up Prometheus, Grafana, and Alertmanager in eks-monitoring/ (platform-tools repo). Your Kubernetes alerting is alert rules plus Alertmanager routing layered onto that stack — coordinate with 2.1's owner on where your rules live and how the Alertmanager config is shared.
+	•	Your AWS-level targets are teammates' resources. The databases you alert on are created by the app-delivery stories — RDS MySQL by 3.1 (Versus) and DocumentDB by 3.3 (Proshop) — and the ingress / ALB by 1.3. These appear over the course of the project, so in week 1 some won't exist yet. Design your alarm Terraform to take the resource identifier as input rather than hardcoding an instance that isn't there.
+	•	Notifications go to one shared Slack channel. Request the team's Slack bot token / incoming webhook from the coordinator (Bakhtiyar) early — both your CloudWatch path and your Alertmanager path converge on the same channel.
+	•	Your live-fire demo waits on 2.1's metrics flowing and on the app databases existing — but plenty of this story is real work before then (see Week-1 work below). Don't sit idle.
+Week-1 work (before metrics are flowing)
+You are not blocked. Before 2.1's stack and the app databases exist you can — and should — produce: the alert taxonomy (the categories you'll page on and why each is page-worthy rather than dashboard-worthy), the*runbook structure* and at least a first draft, the Slack routing design (one channel or severity-split? grouping strategy?), and the*CloudWatch alarm module* itself (it lands ready the moment 3.1's RDS does). The live-fire demo is the last step, not the first.
+Your work
+This story spans two repos plus docs: CloudWatch alarms as Terraform in{{terraform-infra-<BATCH><TEAM>}}, Kubernetes alert rules + Alertmanager routing on 2.1's stack in platform-tools<BATCH>-<TEAM>, and the runbooks / policy as documentation.
+You own the design — which signals to alert on, the thresholds and evaluation windows, the Slack routing mechanism (AWS Chatbot vs. an SNS-to-Slack forwarder vs. Alertmanager's Slack receiver), the runbook format, and how you induce failures to demo. The gotchas flag the traps worth reasoning through; they don't hand you the setup. What's not negotiable:
+	•	AWS-level alerts are alarm-as-code — Terraform, in a{{cloudwatch-alarms/}} (or similarly named) module called from your env roots, deployed via GitHub Actions. No off-the-shelf Terraform modules (scaffold convention); no clicking alarms together in the console.
+	•	Kubernetes alerting layers onto 2.1's Alertmanager — you add alert rules and routing, you do not deploy a parallel alerting stack. Sequence your changes with 2.1's owner (the Alertmanager config is effectively shared — see gotchas).
+	•	All alerts route to the team's shared Slack channel. One place the whole team sees, not your personal email.
+	•	Every alert has a runbook and a defensible reason to page. An alert with no human action behind it is noise — and noise is the thing this story is graded on removing. The selection of alerts is yours; the requirement that each one is justified and runbook-backed is not.
+Acceptance criteria
+	•	Alerts span both layers — AWS-level via CloudWatch and Kubernetes-level via 2.1's Alertmanager — and you can defend each one (and at least one thing you chose not to alert on) against your alert-vs-noise policy.
+	•	At least one alert is on an app database (RDS or DocumentDB) — e.g. CPU, connection count, or free storage; the specific signal is your call.
+	•	AWS-level alarms are Terraform, deployed via GitHub Actions, no off-the-shelf modules; the module takes resource identifiers as inputs rather than hardcoding instances.
+	•	Kubernetes alert rules + Alertmanager routing layer onto 2.1's stack (no second Prometheus / Alertmanager), with the change sequenced with 2.1's owner.
+	•	All alerts route to the shared team Slack channel.
+	•	Live-fire: at least 2 induced failures you trigger yourself fire to Slack — at least one Kubernetes-level (e.g. a deliberate{{CrashLoopBackOff}}) and at least one AWS-level (the AWS one may be driven with aws cloudwatch set-alarm-state for the demo — see gotchas).
+	•	At least 2 runbooks, each actionable (diagnosis steps + first response, not ""restart it""), reviewed by the PM and a teammate.
+	•	Alert-vs-noise policy written down (""what's an alert vs. what's a metric""), and tuning applied — grouping, evaluation periods/datapoints, missing-data handling, inhibition — so a single incident is one message, not a storm.
+	•	README + WORKING-WITH-AI.md memoir.
+Deliverables
+	1	CloudWatch alarm module (Terraform, infra repo) + GHA wiring — parameterised by resource identifier.
+	2	Kubernetes alert rules + Alertmanager routing layered onto 2.1's{{eks-monitoring/}} stack (coordinated with 2.1's owner).
+	3	Slack routing — the path from a firing alarm/alert to the team channel (mechanism your choice).
+	4	Runbooks (at least 2) — one per common alert type.
+	5	Alert-vs-noise policy — the short ""alert vs. metric"" doc.
+	6	README + WORKING-WITH-AI.md memoir.
+Demo (what you walk the PM through)
+	1	Whiteboard: your alert taxonomy — what pages a human vs. what stays on a dashboard — grounded in this platform's real failure modes, not generic alerting talk. Defend one thing you deliberately did not alert on.
+	2	Live: induce a CrashLoopBackOff (bad image or command) — the alert fires to Slack with enough context to act on.
+	3	Live (or via set-alarm-state): an AWS-level alarm transitions to{{ALARM}} and posts to the same Slack channel.
+	4	Walk one runbook end to end as if you were the on-call engineer who just got paged.
+	5	Show the tuning: the grouping / inhibition / evaluation settings that keep one incident from becoming forty messages.
+	6	Anything from the memoir (§3 what Claude got wrong, §4 what I verified) worth surfacing.
+Gotchas & references
+Read Story 2.3 — gotchas before you start, and keep it open while you work. It's a long list on purpose — good alerting is mostly the judgment and the traps (flapping alarms, missing data, alert storms, demoing a failure you can't really cause), and those are most of what separates ""an alarm exists"" from ""I built alerting a team could actually be on-call against."" The more of them you hit and reason through, the better."
+"MRP25CCENT-9","Story","Story 3.1 — Versus on Kubernetes","[MRP25CCENT-9] Story 3.1 — Versus on Kubernetes Created: 01/Jun/26  Updated: 03/Jun/26
+Status:
+To Do
+Project:
+MockRealProject - 25C - CentOS
+Fix versions:
+None
+
+Type:
+Story
+Priority:
+Medium
+Reporter:
+Bakhtiyar Shabdanov
+Assignee:
+tatia razmadze
+Resolution:
+Unresolved
+Votes:
+0
+Labels:
+None
+
+Sprint:
+MRP25CCE Sprint 2
+
+ Description 
+ 
+Epic 3 — App Delivery. App-delivery story — you ship one app (frontend + backend + RDS MySQL) end-to-end onto the team's EKS platform, then review and merge the platform cutover PRs that land on your branch as the rest of the team converges the cluster.
+
+Working with AI on this project
+Read Working with AI first — it covers how to work with Claude Code, the subscription cap, and the standard deliverables (including the required WORKING-WITH-AI.md memoir). This ticket only adds the story-specific pieces.
+
+Story
+Problem statement
+Framing for the team: the Versus app already runs — there's a historical Jenkinsfile and a docker-compose.yaml in the repo from when DevOps ran it the old way. Your job is to put it on the team's EKS platform. Your PM (and a future interviewer) will ask the two questions this story exists to make you answer: ""*it already runs in Docker on a laptop — what did putting it on EKS actually buy us, and can you prove the whole loop works end-to-end without me clicking anything in a console?"" and the one that's specific to being an app owner on a shared platform: ""three of your teammates are going to send PRs that rewrite your IAM, your ingress, and how your secrets are mounted — how do you review a change to your own app that you didn't write?""*
+You own one app on the platform, end-to-end. The deliverable is a*working loop*: a commit to your feature branch builds an image, pushes it, deploys to dev, and a user can hit a URL and see Versus working against its own database. Concretely:
+	1	CI/CD on GitHub Actions — build the frontend and backend images, push to ECR, deploy via Helm.
+	2	Helm charts for both apps, with dev / staging / production values (only dev is exercised — same multi-env convention as the rest of the project).
+	3	RDS MySQL via Terraform, in the team's infra repo, reachable from the backend pods.
+	4	The app reachable at versus-<TEAM>-dev.<TEAM_DOMAIN>, talking to its database.
+The interview narrative isn't ""I wrote a Helm chart"" — it's ""I shipped an app onto the platform end-to-end, and when the platform team moved everyone onto Gateway API, unified IAM, and Secrets-Manager-backed secrets, I reviewed and merged those migrations into my app without breaking it."" The working loop is table stakes; owning the cutovers critically is the story.
+What you're walking into
+Read the Day-0 scaffold every team starts from (repos, empty stubs, OIDC-only IAM, the manual cluster, Terraform conventions, PR rules). Specific to this story:
+	•	The app repo is versus-<BATCH>-<TEAM>. It's a Python backend + an NGINX-served frontend SPA; both ship with a working Dockerfile. It carries a historical Jenkinsfile and a docker-compose.yaml —""what DevOps used to run before you put it on EKS"" — and no GitHub Actions workflows; the CI/CD is yours to write. The backend reads its database connection from MYSQL_* environment variables (see the app README for the exact names).
+	•	You build on the team's cluster (Story 1.1). It is*IPv6-primary* — pods get IPv6 addresses, nodes sit in private, IPv6-only subnets, and egress is via an Egress-Only IGW. This has two consequences you must check, not assume: your RDS MySQL has to be reachable over that network (RDS does IPv6 only as dual-stack, on recent engine versions — see gotchas), and anything the app pods call at runtime over an IPv4-only endpoint is unreachable from the cluster.
+	•	Week-1 baseline (the expedient version you build first). Create your app's own IAM role(s) for image push and secret read (by hand, ad-hoc — Story 1.2 consolidates them later). Deploy against the scaffold's ingress-nginx with a classic Ingress. Use a plain Kubernetes Secret (manually managed) for the DB credentials. Hardcode the hostname. Serve HTTP-only. All four of these get migrated off by the cutover PRs below — don't pre-empt that work.
+	•	Three platform cutovers arrive as PRs into your branch, and reviewing/merging them is part of this story, not theirs:
+	◦	Story 1.2 repoints your workflow/environment at the canonical app CI/CD role and deletes your hand-made one.
+	◦	Story 1.3 moves you from the classic Ingress onto an{{HTTPRoute}} on the shared Gateway.
+	◦	Story 1.5 swaps your plain Secret for a SecretProviderClass (Secrets Manager via the CSI driver), your hardcoded hostname for an external-dns annotation, and HTTP for a cert-manager-issued cert. You review and merge these; you don't author them. Final state: unified IAM, HTTPRoute on Gateway API, secrets via CSI from Secrets Manager, DNS via external-dns, TLS via cert-manager.
+	•	Story 2.3 owns the database alarm, not you. You stand the RDS instance up; 2.3's CloudWatch alarm module takes your RDS identifier as input. You provide the resource (see the output requirement under_Your own-branch work_); 2.3 writes the alarm, not you.
+Your own-branch work
+Two repos: the CI/CD + Helm charts in versus-<BATCH><TEAM>, and the RDS MySQL Terraform in terraform-infra<BATCH>-<TEAM> (root-per-env, no off-the-shelf modules, S3 native locking — all inthe Day-0 scaffold).
+You own the design — the pipeline shape, the chart structure, image tagging, the RDS module layout, how the backend finds the database, how you debug it. The gotchas flag the traps worth reasoning through; they don't hand you the setup. What's not negotiable:
+	•	The whole loop runs through GitHub Actions — build both images, push to ECR, deploy both apps via Helm. No helm/kubectl/docker push from a laptop as the deploy path.
+	•	Helm values exist for dev / staging / production even though only dev deploys, and the hostnames are pinned across them:versus-<TEAM>dev.<TEAM_DOMAIN> (e.g. versus-centos-dev.312centos.com), with versus<TEAM>staging.<TEAM_DOMAIN> and{{versus<TEAM>.<TEAM_DOMAIN>}} defined in their values files. The{{dev}} hostname is a contract Story 1.5's external-dns cutover keys on — keep it stable.
+	•	RDS MySQL is sized for dev, and that's a cost guard, not a shortcut. Everything runs in the single dev account, so: single instance on t3.micro, Multi-AZ off, smallest workable storage. The prod-shaped HA values (Multi-AZ on, larger class) still get defined in the staging/production values that don't deploy — but dev stays cheap. Don't provision up ""to be realistic""; that's a real line on the team's bill.
+	•	The DB credentials live in AWS Secrets Manager and are never committed. In week 1 you consume them via a manually-created plain K8s Secret (Story 1.5's CSI cutover replaces that mechanism later) — but the source of truth is Secrets Manager from day one.
+	•	The RDS module exposes its instance identifier as an output so Story 2.3's alarm module can consume it. You provide the resource; 2.3 owns the alarm.
+Reviewing the cutover PRs (the part that's graded hardest)
+You are on the receiving end of three cross-work normalizations. When 1.2, 1.3, and 1.5 send their PRs, the deliverable is a critical review, not a rubber stamp:
+	•	Pull the branch and confirm the app still builds, deploys, and serves the same routes against the same database after the change — before you approve, not after.
+	•	Read what actually changed and why. A secrets cutover that flips you from env-vars to a bare CSI mount can leave the app starting with no config; an ingress→HTTPRoute cutover can silently drop a behaviour your classic Ingress annotations carried. Catch these in review.
+	•	Each review is a memoir moment (§3 / §4) — what you questioned, what you sent back, what you verified before merging.
+Acceptance criteria
+	•	A commit deploys the app — GitHub Actions builds the frontend and backend images, pushes them to ECR, and deploys both via Helm, with no manual laptop step in the deploy path.
+	•	Helm charts for frontend + backend with dev/staging/prod values present; only dev deployed; hostnames set per the pinned convention across all three.
+	•	RDS MySQL via Terraform — single instance, t3.micro, Multi-AZ off in dev, no off-the-shelf modules, in a private subnet, reachable from the backend pods; instance identifier exposed as a Terraform output.
+	•	DB credentials in Secrets Manager, not committed; consumed in week 1 via a manually-managed plain K8s Secret.
+	•	A user can reach versus-<TEAM>-dev.<TEAM_DOMAIN> and the app works against its database — verifiable end-to-end (e.g. kubectl exec into the backend pod and run a query against RDS).
+	•	The three cutover PRs (1.2 IAM, 1.3 HTTPRoute, 1.5 secrets/DNS/TLS) are reviewed and merged, app behaviour preserved across each; final state runs on Gateway API + cert-manager + external-dns + secrets via CSI driver.
+	•	Per-app IAM role(s) for image push + secret read exist (ad-hoc in week 1; replaced by 1.2's canonical role via its cutover PR).
+	•	README (architecture, the build→deploy loop, run instructions, issues faced) + WORKING-WITH-AI.md memoir + integration handoff doc (below).
+Deliverables
+	1	CI/CD pipeline (GitHub Actions) — build + push to ECR + Helm deploy, in versus-<BATCH>-<TEAM>.
+	2	Helm charts (frontend + backend) with per-env values.
+	3	RDS MySQL Terraform in the infra repo, with the identifier output for Story 2.3.
+	4	README + WORKING-WITH-AI.md memoir.
+	5	Integration handoff doc for the Versus product team (fiction, but written as if real): how to ship a change, what the env-var / secret contract is, the hostnames, and how to roll back. Written for the people who own the app code, not for the platform team.
+Demo (what you walk the PM through)
+	1	Whiteboard: what putting Versus on EKS bought the team over the old Docker/Jenkins shape — grounded in this project, not generic ""containers are good"" talk.
+	2	Live: push a commit → the GitHub Actions run builds, pushes to ECR, and deploys → the change shows up at versus-<TEAM>-dev.<TEAM_DOMAIN>. The whole loop, no console clicking.
+	3	Live: the app talking to RDS — kubectl exec into the backend pod and run a query against the MySQL instance.
+	4	The three cutover PRs you reviewed and merged, before/after: IAM role (hand-made → canonical), ingress (Ingress → HTTPRoute on the Gateway, now HTTPS), secret (plain Secret → SecretProviderClass). What you pushed back on in each.
+	5	The integration handoff doc, read as if you were handing the app back to its product team.
+	6	Anything from the memoir (§3 what Claude got wrong, §4 what I verified) worth surfacing.
+Gotchas & references
+Read Story 3.1 — gotchas before you start, and keep it open while you work. It's a long list on purpose — getting an image to deploy is the easy 20%; the IPv6-only network that your RDS and your runtime egress have to live with, the Python build trap baked into this specific app, and the three cutover PRs you have to review without breaking your own app are most of what separates ""it deployed"" from ""I shipped and owned an app on a shared platform."" The more of them you hit and reason through, the better."
+"MRP25CCENT-10","Story","Story 3.2 — Versus on EC2 (Packer)","[MRP25CCENT-10] Story 3.2 — Versus on EC2 (Packer) Created: 01/Jun/26  Updated: 03/Jun/26
+Status:
+To Do
+Project:
+MockRealProject - 25C - CentOS
+Fix versions:
+None
+
+Type:
+Story
+Priority:
+Medium
+Reporter:
+Bakhtiyar Shabdanov
+Assignee:
+Natalia Tarita
+Resolution:
+Unresolved
+Votes:
+0
+Labels:
+None
+
+Sprint:
+MRP25CCE Sprint 2
+
+ Description 
+ 
+Epic 3 — App Delivery. App-delivery story — you ship the same Versus app a second way: baked into AMIs with Packer and run on EC2 under systemd, instead of in containers on EKS. The deliverable that makes this a story and not a chore is the memo defending when you'd pick each path.
+
+Working with AI on this project
+Read Working with AI first — it covers how to work with Claude Code, the subscription cap, and the standard deliverables (including the required WORKING-WITH-AI.md memoir). This ticket only adds the story-specific pieces.
+
+Story
+Problem statement
+Framing for the team: Versus already has a containerized home on the cluster — Story 3.1 ships it on EKS, or a teammate is doing that in parallel. This story is the *legacy, non-containerized path for the exact same app: two baked AMIs (frontend + backend) running directly on EC2, the app managed by systemd, fronted by a load balancer. Your PM (and a future interviewer) will ask the two questions this story exists to make you answer: ""we already run this in containers — why deploy the same app a second way on bare VMs, and when would you actually choose AMIs-on-EC2 over Kubernetes in real life?"" and the one that's specific to going off-platform: ""on EKS the cluster services handed the app DNS, TLS, and secret injection almost for free — on EC2 you have none of that. How did you provide them, and what did that cost you in effort?""*
+You ship one app, one way that's deliberately the old way, end to end. The deliverable is a working second deployment plus the*comparison memo* that explains the trade-off. Concretely:
+	1	Two Packer AMIs — one for the frontend, one for the backend — each baking the app and its dependencies, with the app run as a*systemd service* (not a foreground process), enabled on boot and restarted on failure.
+	2	EC2 deployment via Terraform — instances behind an Auto Scaling Group, a security group, an AWS load balancer, and an instance profile. In the team's infra repo, same Terraform conventions as the rest of the project.
+	3	A GitLab CI pipeline that builds the AMIs with Packer, applies the Terraform, and runs a post-deploy health check. This runs on the GitLab runner from Story 4.1 (see What you're walking into).
+	4	The app reachable at versus-on-vms-<TEAM>-dev.<TEAM_DOMAIN>, talking to the same database as the EKS path.
+The interview narrative isn't ""I wrote a Packer template"" — it's ""I shipped the same app two ways, the modern container path and the legacy AMI-on-EC2 path, and I can defend the trade-off in either direction."" The working deployment is table stakes; the comparison memo is the story.
+What you're walking into
+Read the Day-0 scaffold every team starts from (repos, empty stubs, OIDC-only IAM, the manual cluster, Terraform conventions, PR rules). Specific to this story:
+	•	Same app repo as Story 3.1: versus-<BATCH>-<TEAM>. Python backend + an NGINX-served frontend SPA, both with a working{{Dockerfile}} and a historical Jenkinsfile / docker-compose.yaml. For this story the Dockerfiles aren't your deploy artifact — your artifact is the AMI. You still reuse what the app needs: the backend reads its database connection from MYSQL_* environment variables (see the app README for the exact names); the frontend is a built static bundle served by NGINX whose API base URL is set at build time (.env.production).
+	•	You depend on Story 4.1 for the pipeline, and that's the one thing that ships later. Story 4.1 brings up the team's GitLab account + project and the GitLab runner on the cluster, and owns the runner's IAM / security boundary. Your CI/CD integration rides that runner.Your Packer builds and your EC2 Terraform are week-1 work — they run locally and independently of 4.1; only the pipeline wiring waits for the runner. Don't sit idle waiting for 4.1.
+	•	You reuse the team's Versus RDS MySQL — you do not stand up a second database. The database is not the variable this story contrasts; the_compute platform_ is. If Story 3.1 is owned on your team, point at that same dev-sized instance; if it isn't, stand one up to 3.1's spec (single instance, t3.micro, Multi-AZ off — the dev cost guard). Two Versus databases in one dev account is wasted spend. Coordinate names and timing in the shared dev account.
+	•	This story is deliberately outside the cluster-services cutover club. Stories 1.2 / 1.3 / 1.5 send IAM / HTTPRoute / secrets-DNS-TLS cutover PRs into the Kubernetes app-delivery branches (3.1, 3.3, 3.5) — not yours. On EC2 there is no Gateway API, no cert-manager, no external-dns, no Secrets Manager CSI driver. You provide DNS, TLS, and secret access yourself (Route53 + an ACM cert on the load balancer + an instance profile that reads Secrets Manager). That extra work is not an oversight — it is half the comparison memo.
+	•	If you place anything in the team's VPC, remember it's IPv6-primary (Story 1.1 — nodes/private subnets are IPv6-only, egress via an Egress-Only IGW). Two consequences to check, not assume: your Packer builder instance needs egress to its package mirrors while it bakes, and your running instances need to reach RDS. See gotchas.
+Your own-branch work
+Two repos: the Packer templates + GitLab CI pipeline in{{versus-<BATCH><TEAM>}}, and the EC2 + load balancer + RDS-reuse Terraform in terraform-infra<BATCH>-<TEAM> (root-per-env, no off-the-shelf modules, S3 native locking — all inthe Day-0 scaffold).
+You own the design — the Packer provisioner steps, what gets baked vs. configured at boot, the ASG shape, the launch-template/instance- refresh deploy strategy, the health-check path, how the frontend finds the backend. The gotchas flag the traps worth reasoning through; they don't hand you the setup. What's not negotiable:
+	•	Two AMIs, built by Packer — frontend and backend separately. The app runs as an enabled systemd service that survives a reboot and restarts on failure — not a foreground npm start / manage.py runserver left running in a provisioner. ""The instance booted"" must mean ""the app is serving.""
+	•	Secrets are never baked into the AMI. The DB credentials live in AWS Secrets Manager and are read at boot by the instance (via its instance profile) — an AMI is a redistributable artifact, and a credential baked into one is a credential leaked. The source of truth is Secrets Manager, same as 3.1.
+	•	The deploy path is the pipeline, not SSH. A change ships by building a new AMI and rolling the ASG onto it (new launch-template version + instance refresh), through the GitLab CI pipeline on 4.1's runner. No ssh in and git pull, no hand-rolled AMI from the console as the deploy path. AMIs are immutable artifacts — tag/version them so every deploy maps to a known image, the same discipline as SHA-tagged container images.
+	•	EC2 is sized for dev, and that's a cost guard. Smallest workable instance class, a minimal ASG (don't oversize desired/max ""to be realistic""), one load balancer. The prod-shaped HA values (bigger class, real min/max, multi-AZ spread) still get defined in the staging/production values that don't deploy — but dev stays cheap. Reusing 3.1's RDS rather than minting a second one is part of this same guard.
+	•	DNS and TLS are yours to wire, directly. The app is reachable at{{versus-on-vms-<TEAM>dev.<TEAM_DOMAIN>}} (e.g.versus-on-vms-centos-dev.312centos.com) via a Route53 record (alias/CNAME) pointing at the load balancer, with TLS terminated by an*ACM certificate on the load balancer*. Define{{versus-on-vms<TEAM>staging.<TEAM_DOMAIN>}} and{{versus-on-vms<TEAM>.<TEAM_DOMAIN>}} in the non-deploying staging/production configs. The on-vms hostname is deliberately distinct from 3.1's versus-<TEAM>-dev... so both deployment paths can run side by side — that coexistence is what makes the comparison real.
+	•	The GitLab CI pipeline has the three stages the path needs: build the AMIs (Packer), deploy the infrastructure (Terraform), and run a post-deploy health check that fails the pipeline if the app isn't actually serving. It runs on Story 4.1's runner (see What you're walking into); coordinate the deploy credentials with 4.1.
+The comparison memo (the part that's graded hardest)
+This story's elevation over ""just deploy it on a VM"" is the memo. It is the artifact an interviewer will actually probe, so write it to be defended, not to be filed:
+	•	Container/EKS path vs. AMI/EC2 path, grounded in this project — not generic ""containers are good."" You shipped (or watched a teammate ship) the same app both ways; compare what each one cost you: build time, deploy time, rollback story, how a new version rolls out, how scaling works, how you got DNS/TLS/secrets, how you'd debug a sick instance vs. a sick pod.
+	•	When you'd actually choose AMIs-on-EC2. There are real answers (no orchestrator to run, regulated/locked-down environments, a vendor appliance shipped as an AMI, predictable long-lived workloads). Pick the honest ones and defend them; don't pretend the legacy path is strictly worse.
+	•	What going off-platform cost. The EKS path inherited DNS, TLS, and secret injection from the cluster services (1.3/1.5). On EC2 you wired ACM, Route53, and Secrets-Manager-at-boot yourself. Quantify that effort — it's the clearest single data point in the whole comparison.
+Acceptance criteria
+	•	Two Packer-built AMIs (frontend + backend), each running the app as an enabled systemd service that survives a reboot and restarts on failure.
+	•	EC2 deployment via Terraform — ASG + security group + load balancer + instance profile, no off-the-shelf modules, sized for dev (smallest workable class, minimal ASG); prod-shaped HA values present in the non-deploying staging/production configs.
+	•	No secrets baked into the AMI — DB credentials read at boot from Secrets Manager via the instance profile.
+	•	GitLab CI pipeline with build-AMI / deploy-infra / health-check stages, running on Story 4.1's runner; no SSH-and-pull or console-built AMI as the deploy path.
+	•	Reuses the team's Versus RDS MySQL (no second database stood up); EC2 instances can reach it.
+	•	A user can reach versus-on-vms-<TEAM>-dev.<TEAM_DOMAIN> over HTTPS — Route53 record to the load balancer, ACM cert on the balancer — and the app works against its database. Hostname is distinct from 3.1's so both paths coexist.
+	•	Resilience demonstrated — terminate an instance and the ASG replaces it; the app comes back without manual intervention.
+	•	README (architecture, the AMI→deploy loop, run instructions, issues faced) + WORKING-WITH-AI.md memoir + comparison memo (below).
+Deliverables
+	1	Packer templates (frontend + backend AMIs) with provisioners and the systemd unit(s), in versus-<BATCH>-<TEAM>.
+	2	EC2/LB Terraform in the infra repo — ASG, security group, load balancer, instance profile, Route53 record, ACM cert.
+	3	GitLab CI pipeline (.gitlab-ci.yml) — build / deploy / health check, on 4.1's runner.
+	4	README + WORKING-WITH-AI.md memoir.
+	5	Comparison memo — container/EKS vs. AMI/EC2, grounded in this project: when you'd pick each, and what going off-platform cost you in DNS/TLS/secrets wiring.
+Demo (what you walk the PM through)
+	1	Whiteboard: the two deployment shapes for the same app side by side, and the honest answer to when you'd pick AMIs-on-EC2 over EKS — grounded in this project, not generic talk.
+	2	Live: trigger the GitLab CI pipeline → it bakes the AMIs, applies the Terraform, and passes the health check → the change shows up at{{versus-on-vms-<TEAM>-dev.<TEAM_DOMAIN>}} over HTTPS. The whole loop, no SSH.
+	3	Live: the app talking to the same RDS the EKS path uses.
+	4	Live: terminate an instance; the ASG replaces it and the app recovers on its own.
+	5	The comparison memo, read as the trade-off argument you'd make to a team deciding how to deploy a new service.
+	6	Anything from the memoir (§3 what Claude got wrong, §4 what I verified) worth surfacing.
+Gotchas & references
+Read Story 3.2 — gotchas before you start, and keep it open while you work. It's a long list on purpose — getting one instance to boot the app is the easy 20%; baking the right things into the AMI (and keeping secrets out), wiring DNS/TLS/secrets yourself with no cluster services to lean on, the same old-Python build trap this app carries (now in the Packer provisioner), and rolling a new AMI through an ASG instead of SSHing in are most of what separates ""it ran on a VM"" from ""I shipped and can defend a second deployment path."" The more of them you hit and reason through, the better."
+"MRP25CCENT-11","Story","Story 3.3 — Proshop on Kubernetes","[MRP25CCENT-11] Story 3.3 — Proshop on Kubernetes Created: 01/Jun/26  Updated: 04/Jun/26
+Status:
+In Progress
+Project:
+MockRealProject - 25C - CentOS
+Fix versions:
+None
+
+Type:
+Story
+Priority:
+Medium
+Reporter:
+Bakhtiyar Shabdanov
+Assignee:
+Irina Tsypysheva
+Resolution:
+Unresolved
+Votes:
+0
+Labels:
+None
+
+Sprint:
+MRP25CCE Sprint 2
+
+ Description 
+ 
+Epic 3 — App Delivery. App-delivery story — you ship one app (React frontend + Node/Express backend + DocumentDB) end-to-end onto the team's EKS platform, then review and merge the platform cutover PRs that land on your branch as the rest of the team converges the cluster.
+
+Working with AI on this project
+Read Working with AI first — it covers how to work with Claude Code, the subscription cap, and the standard deliverables (including the required WORKING-WITH-AI.md memoir). This ticket only adds the story-specific pieces.
+
+Story
+Problem statement
+Framing for the team: Proshop is a MERN e-commerce app that already runs locally — npm run dev brings up the backend and the React frontend against a Mongo connection string. Your job is to put it on the team's EKS platform with its own database. Your PM (and a future interviewer) will ask the question this story exists to make you answer: ""*you pointed a MERN app at AWS DocumentDB, not real MongoDB — what broke, what did you have to work around, and how did you find out?"" — plus the one that's specific to being an app owner on a shared platform: ""three of your teammates are going to send PRs that rewrite your IAM, your ingress, and how your secrets are mounted — how do you review a change to your own app that you didn't write?""*
+You own one app on the platform, end-to-end. The deliverable is a*working loop*: a commit to your feature branch builds the images, pushes them, deploys to dev, and a user can hit a URL and see Proshop's storefront working against its own database. Concretely:
+	1	CI/CD on GitHub Actions — build the frontend and backend images, push to ECR, deploy via Helm.
+	2	Helm charts for both apps, with dev / staging / production values (only dev is exercised — same multi-env convention as the rest of the project).
+	3	DocumentDB via Terraform, in the team's infra repo, reachable from the backend pods.
+	4	The app reachable at proshop-<TEAM>-dev.<TEAM_DOMAIN>, talking to its database.
+The interview narrative isn't ""I wrote a Helm chart"" — it's ""I shipped a MERN app onto the platform end-to-end, learned the hard way which Mongo features DocumentDB doesn't support, and when the platform team moved everyone onto Gateway API, unified IAM, and Secrets-Manager-backed secrets, I reviewed and merged those migrations into my app without breaking it."" The working loop is table stakes;the DocumentDB-compatibility lessons and owning the cutovers critically are the story.
+What you're walking into
+Read the Day-0 scaffold every team starts from (repos, empty stubs, OIDC-only IAM, the manual cluster, Terraform conventions, PR rules). Specific to this story:
+	•	The app repo is proshop-<BATCH>-<TEAM>. It's a MERN stack — a Node/Express backend and a React frontend, both runnable locally with{{npm run dev}} (backend on 5000, frontend on 3000). Unlike some of the other app repos, it ships with neither Dockerfiles nor GitHub Actions workflows — both are yours to write from scratch. The backend reads its database from a MONGO_URI connection string and carries a handful of other env vars (PORT, JWT_SECRET, pagination, and the PayPal ones — see the app README for the full set and which you can leave unset).
+	•	The database is AWS DocumentDB, which is not MongoDB. DocumentDB emulates a subset of the MongoDB API at a specific compatibility version. The app talks to it through Mongoose, and some of what Mongoose/Proshop does against a real Mongo will behave differently — or not work — on DocumentDB. Discovering and documenting those differences is graded work, not a footnote (see the README requirement below and the gotchas).
+	•	You build on the team's cluster (Story 1.1). It is*IPv6-primary* — pods get IPv6 addresses, nodes sit in private, IPv6-only subnets, and egress is via an Egress-Only IGW. This has two consequences you must check, not assume: your DocumentDB cluster has to be reachable from the backend pods over that network (verify the subnet/endpoint addressing — see gotchas), and anything the app pods call at runtime over an IPv4-only endpoint is unreachable from the cluster.
+	•	Week-1 baseline (the expedient version you build first). Create your app's own IAM role(s) for image push and secret read (by hand, ad-hoc — Story 1.2 consolidates them later). Deploy against the scaffold's ingress-nginx with a classic Ingress. Use a plain Kubernetes Secret (manually managed) for the DB credentials. Hardcode the hostname. Serve HTTP-only. All four of these get migrated off by the cutover PRs below — don't pre-empt that work.
+	•	Three platform cutovers arrive as PRs into your branch, and reviewing/merging them is part of this story, not theirs:
+	◦	Story 1.2 repoints your workflow/environment at the canonical app CI/CD role and deletes your hand-made one.
+	◦	Story 1.3 moves you from the classic Ingress onto an{{HTTPRoute}} on the shared Gateway.
+	◦	Story 1.5 swaps your plain Secret for a SecretProviderClass (Secrets Manager via the CSI driver), your hardcoded hostname for an external-dns annotation, and HTTP for a cert-manager-issued cert. You review and merge these; you don't author them. Final state: unified IAM, HTTPRoute on Gateway API, secrets via CSI from Secrets Manager, DNS via external-dns, TLS via cert-manager.
+	•	Story 2.3 owns the database alarm, not you. You stand the DocumentDB cluster up; 2.3's CloudWatch alarm module takes your cluster identifier as input (note: DocumentDB metrics live in the AWS/DocDB namespace, not AWS/RDS). You provide the resource (see the output requirement under Your own-branch work); 2.3 writes the alarm, not you.
+Your own-branch work
+Two repos: the CI/CD + Helm charts in proshop-<BATCH><TEAM>, and the DocumentDB Terraform in terraform-infra<BATCH>-<TEAM> (root-per-env, no off-the-shelf modules, S3 native locking — all inthe Day-0 scaffold).
+You own the design — the pipeline shape, the two {{Dockerfile}}s, the chart structure, image tagging, the DocumentDB module layout, how the backend finds the database, how you debug it. The gotchas flag the traps worth reasoning through; they don't hand you the setup. What's not negotiable:
+	•	The whole loop runs through GitHub Actions — build both images, push to ECR, deploy both apps via Helm. No helm/kubectl/docker push from a laptop as the deploy path.
+	•	Helm values exist for dev / staging / production even though only dev deploys, and the hostnames are pinned across them:proshop-<TEAM>dev.<TEAM_DOMAIN> (e.g. proshop-centos-dev.312centos.com), with proshop<TEAM>staging.<TEAM_DOMAIN> and{{proshop<TEAM>.<TEAM_DOMAIN>}} defined in their values files. The{{dev}} hostname is a contract Story 1.5's external-dns cutover keys on — keep it stable.
+	•	DocumentDB is sized for dev, and that's a cost guard, not a shortcut. Everything runs in the single dev account, so: a single instance on db.t3.medium, smallest workable storage. The prod-shaped HA values (multi-instance cluster, larger class) still get_defined_ in the staging/production values that don't deploy — but{{dev}} stays cheap. Don't provision up ""to be realistic""; that's a real line on the team's bill.
+	•	The DB credentials live in AWS Secrets Manager and are never committed. In week 1 you consume them via a manually-created plain K8s Secret (Story 1.5's CSI cutover replaces that mechanism later) — but the source of truth is Secrets Manager from day one.
+	•	The DocumentDB module exposes its cluster identifier as an output so Story 2.3's alarm module can consume it. You provide the resource; 2.3 owns the alarm.
+Reviewing the cutover PRs (the part that's graded hardest)
+You are on the receiving end of three cross-work normalizations. When 1.2, 1.3, and 1.5 send their PRs, the deliverable is a critical review, not a rubber stamp:
+	•	Pull the branch and confirm the app still builds, deploys, and serves the same routes against the same database after the change — before you approve, not after.
+	•	Read what actually changed and why. A secrets cutover that flips you from a env-var MONGO_URI to a bare CSI mount can leave the backend starting with no connection string; an ingress→HTTPRoute cutover can silently drop a behaviour your classic Ingress annotations carried (e.g. the API path routing, upload body-size limits). Catch these in review.
+	•	Each review is a memoir moment (§3 / §4) — what you questioned, what you sent back, what you verified before merging.
+Acceptance criteria
+	•	A commit deploys the app — GitHub Actions builds the frontend and backend images, pushes them to ECR, and deploys both via Helm, with no manual laptop step in the deploy path.
+	•	Helm charts for frontend + backend with dev/staging/prod values present; only dev deployed; hostnames set per the pinned convention across all three.
+	•	DocumentDB via Terraform — single instance, db.t3.medium in dev, no off-the-shelf modules, in a private subnet with a dedicated security group, reachable from the backend pods; cluster identifier exposed as a Terraform output.
+	•	DB credentials in Secrets Manager, not committed; consumed in week 1 via a manually-managed plain K8s Secret.
+	•	A user can reach proshop-<TEAM>-dev.<TEAM_DOMAIN> and the storefront works against its database — verifiable end-to-end (e.g.kubectl exec into the backend pod and run a Mongo-shell query against the DocumentDB cluster).
+	•	DocumentDB-vs-MongoDB compatibility findings are documented in the README — the specific differences you hit, how you found them, and what you changed (engine version, query, index, or app code) to work around each.
+	•	The three cutover PRs (1.2 IAM, 1.3 HTTPRoute, 1.5 secrets/DNS/TLS) are reviewed and merged, app behaviour preserved across each; final state runs on Gateway API + cert-manager + external-dns + secrets via CSI driver.
+	•	Per-app IAM role(s) for image push + secret read exist (ad-hoc in week 1; replaced by 1.2's canonical role via its cutover PR).
+	•	README (architecture, the build→deploy loop, run instructions, DocumentDB compatibility findings, issues faced) +WORKING-WITH-AI.md memoir + integration handoff doc (below).
+Deliverables
+	1	CI/CD pipeline (GitHub Actions) — build + push to ECR + Helm deploy, in proshop-<BATCH>-<TEAM>, including the two {{Dockerfile}}s you write.
+	2	Helm charts (frontend + backend) with per-env values.
+	3	DocumentDB Terraform in the infra repo, with the cluster identifier output for Story 2.3.
+	4	README + WORKING-WITH-AI.md memoir. The README carries the*DocumentDB-vs-MongoDB compatibility findings* as a first-class section, not an aside.
+	5	Integration handoff doc for the Proshop product team (fiction, but written as if real): how to ship a change, what the env-var / secret contract is (MONGO_URI and friends), the hostnames, the DocumentDB gotchas they need to know, and how to roll back. Written for the people who own the app code, not for the platform team.
+Demo (what you walk the PM through)
+	1	Whiteboard: what putting Proshop on EKS bought the team, and the single most surprising DocumentDB-isn't-Mongo difference you hit — grounded in this project, not generic talk.
+	2	Live: push a commit → the GitHub Actions run builds, pushes to ECR, and deploys → the change shows up at proshop-<TEAM>-dev.<TEAM_DOMAIN>. The whole loop, no console clicking.
+	3	Live: the app talking to DocumentDB — kubectl exec into the backend pod and run a query (and/or run the app's seeder) so the storefront shows real data.
+	4	The three cutover PRs you reviewed and merged, before/after: IAM role (hand-made → canonical), ingress (Ingress → HTTPRoute on the Gateway, now HTTPS), secret (plain Secret → SecretProviderClass). What you pushed back on in each.
+	5	The integration handoff doc, read as if you were handing the app back to its product team.
+	6	Anything from the memoir (§3 what Claude got wrong, §4 what I verified) worth surfacing.
+Gotchas & references
+Read Story 3.3 — gotchas before you start, and keep it open while you work. It's a long list on purpose — getting an image to deploy is the easy 20%; the DocumentDB-isn't-Mongo differences, the build traps baked into this specific repo (no Dockerfiles, two lockfiles, a React build-time API URL), the IPv6-only network your database has to live on, and the three cutover PRs you have to review without breaking your own app are most of what separates ""it deployed"" from ""I shipped and owned an app on a shared platform."" The more of them you hit and reason through, the better."
+"MRP25CCENT-12","Story","Story 3.4 — Serverless-memo app","[MRP25CCENT-12] Story 3.4 — Serverless-memo app Created: 01/Jun/26  Updated: 03/Jun/26
+Status:
+To Do
+Project:
+MockRealProject - 25C - CentOS
+Fix versions:
+None
+
+Type:
+Story
+Priority:
+Medium
+Reporter:
+Bakhtiyar Shabdanov
+Assignee:
+Nino Tezelashvili
+Resolution:
+Unresolved
+Votes:
+0
+Labels:
+None
+
+Sprint:
+MRP25CCE Sprint 2
+
+ Description 
+ 
+Epic 3 — App Delivery. App-delivery story — you ship the Serverless-memo app end-to-end on AWS-native serverless primitives (API Gateway HTTP API + Lambda + DynamoDB + Cognito + CloudFront/S3), with no container and no VM anywhere in the path. The deliverable that makes this a story and not a chore is the design doc tracing the serverless data flow and defending the trade-off.
+
+Working with AI on this project
+Read Working with AI first — it covers how to work with Claude Code, the subscription cap, and the standard deliverables (including the required WORKING-WITH-AI.md memoir). This ticket only adds the story-specific pieces.
+
+Story
+Problem statement
+Framing for the team: every other app on this project runs on the cluster (or, for the contrast story, on VMs). This one is the team's*serverless answer — the same ""ship an app end-to-end"" job, but with nothing to patch, no node to size, no VPC to wire. Your PM (and a future interviewer) will ask the questions this story exists to make you answer: ""you didn't run a single container or VM — so where does the app actually live, and what runs when a signed-in user saves a memo?"" and ""what did going serverless buy you, and what did it cost — when would you reach for this over the EKS path the rest of the team built?""*
+You ship one app, entirely on managed serverless services, end to end. The deliverable is a working app a teammate can sign up for and use, plus the design doc that traces the data flow and defends the trade-off. Concretely:
+	1	The full serverless path — a React frontend served from S3 behind CloudFront, calling an API Gateway HTTP API that proxies to a Lambda (the app's serverless-express backend), persisting to DynamoDB.
+	2	Working authentication via Amazon Cognito — sign-up and sign-in must actually work: a teammate can self-register through the flow and use the app. The app already ships two backend handlers (one Cognito-authenticated, one anonymous/public); the authenticated path has to be genuinely gated.
+	3	All of it provisioned with Terraform, on the same conventions as the rest of the project (root-per-env, no off-the-shelf modules, S3 native locking — see What you're walking into), driven by a CI/CD pipeline so a commit ships a change.
+The interview narrative isn't ""I wrote some Lambda Terraform"" — it's_""I shipped a serverless app on AWS-native primitives — API Gateway, Lambda, DynamoDB, Cognito — without a container or VM in sight, and I can draw the request path and defend the trade-off.""_ The working app is table stakes; the design doc is the story.
+What you're walking into
+Read the Day-0 scaffold every team starts from (repos, empty stubs, OIDC-only IAM, the manual cluster, Terraform conventions, PR rules). Most of it is cluster context that*doesn't apply to you* — this story touches no EKS, no nodes, no VPC. What carries over is the Terraform conventions and the OIDC-only IAM starting point. Specific to this story:
+	•	The app repo is serverless-memo-<BATCH>-<TEAM>. A Vite-built React frontend (not Create-React-App) and a Node serverless-express backend with two Lambda handlers — one authenticated through Cognito, one anonymous/public. The frontend reads its API endpoint and Cognito IDs from a build-time .env (the repo ships helper scripts that swap a local-dev .env for a deployed-config one — see gotchas).You keep the application code as-is; you do not port the app.
+	•	The repo's infrastructure-as-code is not in our shape. The app was originally provisioned with AWS CDK; this project standardises on*Terraform + GitHub Actions*, so the expectation is that you*rebuild the infrastructure from scratch in Terraform* (root-per-env, no off-the-shelf modules, S3 native locking — all inthe Day-0 scaffold) while leaving the app code untouched. There is no Terraform in the repo to start from. If you make the call to use a different IaC tool instead — keeping or ""upgrading"" to CDK, say — that's a legitimate decision, but it's yours to defend: be ready to justify it live in the demo and write the reasoning into your design doc. Don't reach for CDK silently just because the repo already had it; Terraform is the default, and deviating is a choice you own and argue for.
+	•	This story is fully independent — it can ship in full from Day 1. It depends on no other story: not the EKS cluster, not the manual scaffold cluster, not the traffic-plane work. It is also deliberately*outside the cluster-services cutover club* — Stories 1.2 / 1.3 / 1.5 send their IAM / HTTPRoute / secrets-DNS-TLS cutover PRs into the_Kubernetes_ app branches (3.1, 3.3, 3.5), not yours. There is no Gateway API, no cert-manager, no external-dns, no Secrets-Manager CSI driver here. Your DNS / TLS / auth equivalents are CloudFront, ACM-on-CloudFront, and Cognito, and you own them end to end.
+	•	You bootstrap your own state backend and your own deploy role. The scaffold ships exactly one IAM thing — the GitHub OIDC provider; no roles pre-exist and the S3 state bucket isn't created. Because you're independent of Story 1.1, you do that bootstrap yourself (first apply from a laptop with SSO creds creates the state bucket + a minimal GHA deploy role; GHA runs everything after). Don't wait on 1.1, and don't expect a 1.2 PR to normalise your IAM later — that consolidation targets the cluster apps, not this one.
+	•	No VPC — and that's a design point, not a gap. Lambda, DynamoDB, API Gateway, and Cognito are all reachable as managed AWS endpoints, so unlike the EKS and EC2 stories you don't touch the team's IPv6-primary VPC at all. That absence (no NAT, no subnets, no node egress to reason about) is one of the clearest contrast points for the design doc — name it, don't just enjoy it.
+Your own-branch work
+Everything lives in serverless-memo-<BATCH>-<TEAM>: the Terraform you write (root-per-env, no off-the-shelf modules, S3 native locking) and the CI/CD pipeline alongside the unchanged app code.
+You own the design — the Cognito user-pool shape (hosted UI vs. your own forms, where the JWT is validated, the email-verification flow),where each piece of state lives (DynamoDB vs. S3 vs. Cognito itself), whether the Lambda ships as a container image or a zip, and the single-table-vs-multiple DynamoDB layout. The gotchas flag the traps worth reasoning through; they don't hand you the setup. What's not negotiable:
+	•	Cognito sign-up and sign-in must work end-to-end. This is the story's defining requirement: a teammate self-registers through the flow and uses the app, and the authenticated handler is genuinely gated by a valid Cognito token while the public handler stays anonymous. ""Auth is wired but nobody can actually sign up"" does not pass.
+	•	The whole path is serverless and managed — API Gateway HTTP API → Lambda (serverless-express) → DynamoDB for the API; S3 + CloudFront for the static frontend. No container orchestrator, no VM, no always-on compute in the request path.
+	•	DynamoDB runs on-demand (PAY_PER_REQUEST). Don't provision fixed read/write capacity ""to be realistic"" — the point of serverless is no idle cost, and a dev memo app has no throughput floor to plan for. This is the cost guard for this story; keeping the whole stack scale-to-zero is also a data point for the design doc.
+	•	The frontend is served from a private S3 bucket behind CloudFront via Origin Access Control — not a public S3 website bucket. CloudFront is the only public door; the bucket itself stays private.
+	•	A commit ships a change, through the pipeline. The GitHub Actions pipeline applies the Terraform, deploys the Lambda, and publishes the frontend (S3 sync + CloudFront invalidation). No ""build the bucket by hand and drag files in,"" no console-clicked Lambda as the deploy path.
+	•	Reachable through CloudFront. The distribution domain is enough; a custom Route53 name on the team zone (with an ACM cert — note the CloudFront-cert-must-be-us-east-1 trap in gotchas) is encouraged if you want parity with the other apps' URLs, but it's your call, not a requirement.
+The serverless design doc (the part that's graded hardest)
+This story's elevation over ""deploy a Lambda"" is the design doc. It's the artifact an interviewer will actually probe, so write it to be defended, not filed:
+	•	Trace the data flow end to end, grounded in this app. Two paths: an anonymous browser loading the SPA (request → CloudFront → S3), and a signed-in user saving a memo (request → API Gateway → Lambda → DynamoDB, with the Cognito token validated where?). Draw it; be able to say what runs and what's at rest at each hop.
+	•	Where each piece of state lives, and why. Memos, user identity, static assets, uploaded files — each lands in DynamoDB, Cognito, or S3. Defend the placement (this is the call the ticket explicitly leaves to you).
+	•	What serverless bought you, and what it cost. The honest both-sides version: no nodes to patch, no VPC, scale-to-zero cost, managed auth — against cold starts, harder local debugging, vendor lock-in, and IAM/permission wiring that fails in non-obvious ways (see gotchas). When would you pick this over the team's EKS path? Pick the honest answers and defend them.
+Acceptance criteria
+	•	The serverless path works — API Gateway HTTP API → Lambda (serverless-express) → DynamoDB; both the authenticated and the public handler are reachable and behave correctly.
+	•	Cognito sign-up and sign-in work end-to-end — a teammate can self-register through the flow and use the app; the authenticated handler is gated by a valid token, the public one isn't. (The defining requirement — not optional.)
+	•	The React frontend is served via CloudFront over a private S3 bucket (Origin Access Control, not a public website bucket).
+	•	Infrastructure as code on the project standard (Terraform + GHA) — project conventions (root-per-env, no off-the-shelf modules, S3 native locking); own state backend + GHA deploy role bootstrapped independently (no 1.2 normalisation PR arrives). Any deviation (e.g. CDK) is defended live in the demo and in the design doc.
+	•	DynamoDB on-demand (PAY_PER_REQUEST), no provisioned throughput.
+	•	CI/CD pipeline — a commit applies the Terraform, deploys the Lambda, and publishes the frontend (S3 sync + CloudFront invalidation); no by-hand/console deploy path.
+	•	Reachable through CloudFront (distribution domain, or a custom team-zone name if you chose parity).
+	•	README (architecture, the deploy loop, run instructions, issues faced) + WORKING-WITH-AI.md memoir + serverless design doc (below).
+Deliverables
+	1	Terraform for the whole stack — API Gateway HTTP API, Lambda, DynamoDB, Cognito, CloudFront, S3 — in serverless-memo-<BATCH>-<TEAM>, on the project conventions.
+	2	CI/CD pipeline (GitHub Actions) — Terraform apply + Lambda deploy + frontend publish.
+	3	README + WORKING-WITH-AI.md memoir.
+	4	Serverless design doc — the request-path diagram, the state-placement decisions, and the serverless trade-off, defended.
+Demo (what you walk the PM through)
+	1	Whiteboard: the serverless data flow for both paths (anonymous SPA load; signed-in memo save), where auth happens, where state lives — grounded in this app, not generic ""serverless is cheap"" talk.
+	2	Live: a teammate signs up through the Cognito flow, signs in, creates a memo and reads it back.
+	3	Live: the public vs. authenticated handler — the anonymous path works without a token; the gated path rejects a request without a valid one.
+	4	Live: a commit → the pipeline applies the Terraform, deploys the Lambda, and publishes the frontend → the change shows up through CloudFront. The whole loop, no console clicking.
+	5	The design doc, read as the trade-off argument you'd make to a team deciding whether to build a new service serverless or on the cluster.
+	6	Anything from the memoir (§3 what Claude got wrong, §4 what I verified) worth surfacing.
+Gotchas & references
+Read Story 3.4 — gotchas before you start, and keep it open while you work. It's a long list on purpose — getting a ""hello world"" Lambda behind API Gateway is the easy 20%; the API-Gateway→Lambda invoke permission that fails as a mystery 500, the build-time Cognito/API config baked into the frontend bundle, serving a private S3 bucket through CloudFront without making it public, and getting real sign-up working in Cognito are most of what separates ""a Lambda returned JSON once"" from ""I shipped a serverless app I can defend."" The more of them you hit and reason through, the better."
+"MRP25CCENT-13","Story","Story 3.5 — Weather backend on Kubernetes","[MRP25CCENT-13] Story 3.5 — Weather backend on Kubernetes Created: 01/Jun/26  Updated: 04/Jun/26
+Status:
+In Progress
+Project:
+MockRealProject - 25C - CentOS
+Fix versions:
+None
+
+Type:
+Story
+Priority:
+Medium
+Reporter:
+Bakhtiyar Shabdanov
+Assignee:
+Alexander Samay
+Resolution:
+Unresolved
+Votes:
+0
+Labels:
+None
+
+Sprint:
+MRP25CCE Sprint 2
+
+ Description 
+ 
+Epic 3 — App Delivery. App-delivery story — you ship one app'sbackend (Node.js, backed by a managed external database it doesn't provision, so the real work is the pipeline and the external API calls) end-to-end onto the team's EKS platform, run the real mobile frontend in an emulator (and a test client you build) to prove it works, then review and merge the platform cutover PRs that land on your branch as the rest of the team converges the cluster.
+
+Working with AI on this project
+Read Working with AI first — it covers how to work with Claude Code, the subscription cap, and the standard deliverables (including the required WORKING-WITH-AI.md memoir). This ticket only adds the story-specific pieces.
+
+Story
+Problem statement
+Framing for the team: the Weather app is a React Native mobile frontend talking to a Node.js backend. The frontend isn't yours — it runs on a phone emulator and someone else owns it. Your job is to put the*backend on the team's EKS platform. The catch is what the backend_does_: every request fans out to three external services — Google Geocoding (turn a place name into coordinates), OpenWeather (the forecast), and Firestore (auth + analytics). Your PM (and a future interviewer) will ask the questions this story exists to make you answer: ""your backend's entire job is to reach three external APIs, and you put it on a cluster whose only egress is IPv6-only — how did you get those calls out, and how did you find out they were failing?"", the one that's specific to not owning the other half of the app: ""you don't own the frontend — it's a mobile app on someone's emulator — so how did you prove your backend actually works?"", and the one every app owner on a shared platform gets: ""three of your teammates are going to send PRs that rewrite your IAM, your ingress, and how your secrets are mounted — how do you review a change to your own app that you didn't write?""*
+You own one backend on the platform, end-to-end. The deliverable is a*working loop*: a commit to your feature branch builds the image, pushes it, deploys to dev, and a request hits a URL and gets back a real forecast — sourced live from the external APIs. Concretely:
+	1	CI/CD on GitHub Actions — build the backend image, push to ECR, deploy via Helm.
+	2	A Helm chart with dev / staging / production values (only{{dev}} is exercised — same multi-env convention as the rest of the project).
+	3	The backend reachable at weather-<TEAM>-dev.<TEAM_DOMAIN>, able to reach its three external dependencies and return a real response.
+	4	A test client you build — because you don't own the frontend, you have to make the backend demonstrably work without it.
+The interview narrative isn't ""I wrote a Helm chart"" — it's ""I shipped a backend whose whole job was to call external APIs from a cluster that couldn't reach them by default, I built my own client to prove it worked since I didn't own the frontend, and when the platform team moved everyone onto Gateway API, unified IAM, and Secrets-Manager-backed secrets, I reviewed and merged those migrations into my app without breaking it."" The working loop is table stakes;the egress story, the test client, and owning the cutovers critically are the story.
+What you're walking into
+Read the Day-0 scaffold every team starts from (repos, empty stubs, OIDC-only IAM, the manual cluster, Terraform conventions, PR rules). Specific to this story:
+	•	The app repo is weather-<BATCH>-<TEAM>. The backend is a Node.js service, runnable locally. Unlike some of the other app repos, it ships with a working Dockerfile — you build from it, you don't write it from scratch — but it has no GitHub Actions workflows; the pipeline is yours. The backend reads its two external API keys and its Firestore credentials from the environment (see the app README for the exact env-var names and shapes — GOOGLE_API_KEY and the forecast key among them).
+	•	The frontend isn't yours to deploy — but it's real, and you'll run it. It's the React Native mobile app in the repo, Android-only, run*locally in the Android Studio emulator*. There is no CI/CD for it and none is expected — you don't pipeline or deploy it. But pointing the emulator at your deployed backend (via the frontend's SERVER_URL) is the natural end-to-end demo, so you will stand the emulator up. Its setup is fiddly (see gotchas); budget for it — and remember the graded loop is the backend pipeline, not the app.
+	•	The backend's database is external and managed — you don't provision it. Its persistence lives in Firestore (a Google-managed NoSQL database), and the weather data comes from Google Geocoding + OpenWeather. So there is no AWS database to stand up in Terraform, and — unlike Stories 3.1 and 3.3, which provision RDS/DocumentDB —nothing in CloudWatch for Story 2.3 to alarm. Don't provision one. The flip side: all three of those dependencies are external endpoints your pods have to reach over the network, which is the hard part below.
+	•	You build on the team's cluster (Story 1.1). It is*IPv6-primary* — pods get IPv6 addresses, nodes sit in private, IPv6-only subnets, and egress is via an Egress-Only IGW that is IPv6-only. Your backend's entire purpose is to call IPv4 external APIs (OpenWeather, Google Geocoding, Firestore). Whether those endpoints answer over IPv6 is something you must verify, not assume — if they don't have AAAA records, they're unreachable from the cluster until you provide an IPv4 egress path. This bites at runtime and at image-build time (npm registries, github.com). See the gotchas.
+	•	Week-1 baseline (the expedient version you build first). Create your app's own IAM role(s) for image push and secret read (by hand, ad-hoc — Story 1.2 consolidates them later). Deploy against the scaffold's ingress-nginx with a classic Ingress. Use a plain Kubernetes Secret (manually managed) for the API keys and Firestore credentials. Hardcode the hostname. Serve HTTP-only. All four of these get migrated off by the cutover PRs below — don't pre-empt that work.
+	•	Three platform cutovers arrive as PRs into your branch, and reviewing/merging them is part of this story, not theirs:
+	◦	Story 1.2 repoints your workflow/environment at the canonical app CI/CD role and deletes your hand-made one.
+	◦	Story 1.3 moves you from the classic Ingress onto an{{HTTPRoute}} on the shared Gateway.
+	◦	Story 1.5 swaps your plain Secret for a SecretProviderClass (Secrets Manager via the CSI driver) — this is where your external API keys land in Secrets Manager — your hardcoded hostname for an external-dns annotation, and HTTP for a cert-manager-issued cert. You review and merge these; you don't author them. Final state: unified IAM, HTTPRoute on Gateway API, secrets via CSI from Secrets Manager, DNS via external-dns, TLS via cert-manager.
+Your own-branch work
+Two repos: the CI/CD + Helm chart in weather-<BATCH><TEAM>, and whatever light infra you need (the ECR repository and your ad-hoc IAM role(s)) in terraform-infra<BATCH>-<TEAM> (root-per-env, no off-the-shelf modules, S3 native locking — all inthe Day-0 scaffold). There's no database module here — the infra footprint is genuinely lighter than the other K8s app stories.
+You own the design — the pipeline shape, the chart structure, image tagging, how the backend gets its keys, how you make the external calls reachable, how you debug it, and what your test client looks like. The gotchas flag the traps worth reasoning through; they don't hand you the setup. What's not negotiable:
+	•	The whole loop runs through GitHub Actions — build the image, push to ECR, deploy via Helm. No helm/kubectl/docker push from a laptop as the deploy path.
+	•	Helm values exist for dev / staging / production even though only dev deploys, and the hostnames are pinned across them:weather-<TEAM>dev.<TEAM_DOMAIN> (e.g. weather-ubuntu-dev.312ubuntu.com), with weather<TEAM>staging.<TEAM_DOMAIN> and{{weather<TEAM>.<TEAM_DOMAIN>}} (prod has no -dev/-staging suffix) defined in their values files. The dev hostname is a contract Story 1.5's external-dns cutover keys on — keep it stable. Deploy into the weather-app namespace.
+	•	The external API keys and Firestore credentials live in AWS Secrets Manager and are never committed. In week 1 you consume them via a manually-created plain K8s Secret (Story 1.5's CSI cutover replaces that mechanism later) — but the source of truth is Secrets Manager from day one, and the backend reads them as the environment variables the app expects.
+	•	Tag images by git SHA on an immutable ECR repo — every deploy maps to exactly one commit, and rollback is to a known tag, not a guess.
+Proving the backend works
+You have two ways to prove your backend works, and you'll use both:
+	•	Run the real app in the Android Studio emulator against your deployed backend. The frontend is the actual React Native app in the repo; point its SERVER_URL at your team backend URL and you can watch the real mobile app pull a live forecast through the platform you built. This is the most convincing end-to-end check, and it's what you walk the PM through. Budget time — the emulator setup is genuinely fiddly (see gotchas).
+	•	Build a lightweight test client. Because the emulator is fragile and you don't own the frontend, you also build a small client of your own — curl scripts, a tiny static HTML page, or equivalent — that drives the backend's real endpoint(s) the same way the app does. This is the pinned deliverable: it's automatable, a teammate can run it without an emulator, and it doesn't block on someone else's app setup.
+Whichever you're validating with:
+	•	Read the backend's own docs / request-flow to learn the exact request shape the frontend sends (path, method, query/body) — your test client has to speak the same contract.
+	•	It must hit the deployed backend at its team URL and get a real response sourced from the external APIs — not a mock, and not{{localhost}}.
+	•	A teammate should be able to run your test client (or open your page) and get a forecast back without you driving.
+Reviewing the cutover PRs (the part that's graded hardest)
+You are on the receiving end of three cross-work normalizations. When 1.2, 1.3, and 1.5 send their PRs, the deliverable is a critical review, not a rubber stamp:
+	•	Pull the branch and confirm the backend still builds, deploys, and serves the same endpoint with the same external calls working after the change — before you approve, not after.
+	•	Read what actually changed and why. A secrets cutover that flips you from env-var keys to a bare CSI mount can leave the backend starting with no API keys (external calls then fail with 401s or empty responses, not an obvious crash); an ingress→HTTPRoute cutover can silently drop a behaviour your classic Ingress annotations carried (e.g. path routing). Catch these in review.
+	•	Each review is a memoir moment (§3 / §4) — what you questioned, what you sent back, what you verified before merging.
+Acceptance criteria
+	•	A commit deploys the backend — GitHub Actions builds the image (from the repo's Dockerfile), pushes it to ECR, and deploys via Helm, with no manual laptop step in the deploy path.
+	•	A Helm chart with dev/staging/prod values present; only{{dev}} deployed into the weather-app namespace; hostnames set per the pinned convention across all three.
+	•	The backend reaches its external dependencies — Google Geocoding, OpenWeather, and Firestore are reachable from the pods over the cluster's egress path; verified end-to-end, not assumed.
+	•	API keys + Firestore credentials in Secrets Manager, not committed; consumed in week 1 via a manually-managed plain K8s{{Secret}}, read by the backend as the env vars it expects.
+	•	A test client exists and works — exercises the deployed backend's real endpoint(s) and returns a live forecast; runnable by a teammate without you driving.
+	•	A request to weather-<TEAM>-dev.<TEAM_DOMAIN> returns a real response — verifiable end-to-end via the test client.
+	•	The three cutover PRs (1.2 IAM, 1.3 HTTPRoute, 1.5 secrets/DNS/TLS) are reviewed and merged, app behaviour preserved across each; final state runs on Gateway API + cert-manager + external-dns + secrets via CSI driver.
+	•	Per-app IAM role(s) for image push + secret read exist (ad-hoc in week 1; replaced by 1.2's canonical role via its cutover PR).
+	•	README (architecture, the build→deploy loop, run instructions, the external-API egress story, issues faced) +WORKING-WITH-AI.md memoir + integration handoff doc (below).
+Deliverables
+	1	CI/CD pipeline (GitHub Actions) — build (from the repo's{{Dockerfile}}) + push to ECR + Helm deploy, in weather-<BATCH>-<TEAM>.
+	2	Helm chart with per-env values.
+	3	Light infra Terraform in the infra repo — the ECR repository and your ad-hoc IAM role(s). No database module.
+	4	Test client — curl scripts or a small static page that drives the deployed backend through a real round-trip.
+	5	README + WORKING-WITH-AI.md memoir. The README carries the*external-API egress story* (what wasn't reachable from the IPv6-only cluster, how you found out, what you changed) as a first-class section, not an aside.
+	6	Integration handoff doc for the Weather product team (fiction, but written as if real): how to ship a backend change, what the env-var / secret contract is (the API keys + Firestore credentials), the hostname, the egress dependencies they need to know about, and how to roll back. Written for the people who own the app code, not for the platform team.
+Demo (what you walk the PM through)
+	1	Whiteboard: what putting the Weather backend on EKS bought the team, and the single most surprising thing about getting an external-API backend to actually reach its APIs from this cluster — grounded in_this_ project, not generic talk.
+	2	Live: push a commit → the GitHub Actions run builds, pushes to ECR, and deploys → the change shows up at weather-<TEAM>-dev.<TEAM_DOMAIN>. The whole loop, no console clicking.
+	3	Live: the real app in the Android Studio emulator (and/or your*test client*) hits the deployed backend and a live forecast comes back — the actual mobile experience running against the platform you built.
+	4	The three cutover PRs you reviewed and merged, before/after: IAM role (hand-made → canonical), ingress (Ingress → HTTPRoute on the Gateway, now HTTPS), secret (plain Secret → SecretProviderClass). What you pushed back on in each.
+	5	The integration handoff doc, read as if you were handing the backend back to its product team.
+	6	Anything from the memoir (§3 what Claude got wrong, §4 what I verified) worth surfacing.
+Gotchas & references
+Read Story 3.5 — gotchas before you start, and keep it open while you work. This is the lighter-scope K8s app story, but ""lighter"" doesn't mean easy: getting an image to deploy is the easy 20%; making three IPv4 external APIs reachable from an IPv6-only cluster, proving the backend works when you don't own the frontend, and reviewing the three cutover PRs without breaking your own app are most of what separates ""it deployed"" from ""I shipped and owned an app on a shared platform."" The more of them you hit and reason through, the better."
+"MRP25CCENT-14","Story","Story 4.1 — GitLab runner on Kubernetes","[MRP25CCENT-14] Story 4.1 — GitLab runner on Kubernetes Created: 01/Jun/26  Updated: 03/Jun/26
+Status:
+To Do
+Project:
+MockRealProject - 25C - CentOS
+Fix versions:
+None
+
+Type:
+Story
+Priority:
+Medium
+Reporter:
+Bakhtiyar Shabdanov
+Assignee:
+Unassigned
+Resolution:
+Unresolved
+Votes:
+0
+Labels:
+None
+
+Sprint:
+MRP25CCE Sprint 2
+
+ Description 
+ 
+Epic 4 — Alternative Paths. A build-and-own story: bring a second CI system (GitLab CI) onto a team that ships everything through GitHub Actions, run it on the team's own cluster, and own the security model for it. The decision doc on when to pick each CI system is the graded heart of the story.
+
+Working with AI on this project
+Read Working with AI first — it covers how to work with Claude Code, the subscription cap, and the standard deliverables (including the required WORKING-WITH-AI.md memoir). This ticket only adds the story-specific pieces.
+
+Story
+Problem statement
+Framing for the team: the platform runs all of its CI on GitHub Actions, and in the real world it would *stay that way — a team doesn't run two CI systems side by side. So why are you standing up GitLab CI at all? Portfolio diversity. GitLab CI is the other major CI player alongside GitHub Actions, and getting hands-on with it — a runner on your own cluster, a real job, the security model — is worth a line on your résumé and a confident answer in an interview. Your PM (and a future interviewer) will ask ""how do companies actually choose between GitHub Actions and GitLab CI?"" The honest answer (see the production note) is the graded payoff, not the Helm install.*
+Bring up a GitLab runner on the team's EKS cluster, registered to a GitLab project, executing real CI jobs with the Kubernetes executor (each job runs in its own pod), scaled to run multiple jobs concurrently, and scoped with a tight IAM boundary so CI jobs get exactly the AWS access they need and nothing more.
+This is not a ""get a runner to say hello"" story — it's a ""stand up a production-shaped CI system on the team's cluster, own its security model, and be able to explain where GitLab CI fits in the wider landscape"" story. The CI-system comparison doc you write and the*runner IAM/security boundary* you design are the graded heart of it; a green pipeline is just the proof it works.
+Production note (you will be asked to defend this). You are running GitLab CI alongside GitHub Actions here purely to learn it — that is*not* a real end-state. In practice an organization picks one ecosystem, and it's almost always the one its VCS already lives in:GitLab shops run GitLab CI; GitHub shops use GitHub Actions (teams that started elsewhere tend to migrate onto Actions once they're on GitHub). There is no financial sense in paying for both GitHub and GitLab licenses just to run CI — the CI choice rides the VCS/platform decision, it isn't made on its own. So in a real company GitLab would already be the VCS and the org (billing configured, repos living there, group-level runners shared across projects); here you're standing up just the runner against a throwaway GitLab project to get the hands-on reps. Be ready to say all of this — why you wouldn't really run both, and what's different about doing it for real — because that reasoning is the interview gold, not the runner itself.
+What you're walking into
+Read the Day-0 scaffold every team starts from (repos, empty stubs, OIDC-only IAM, the manual cluster, Terraform conventions, PR rules). Specific to this story:
+	•	You run on the team's Terraform-managed EKS cluster (Story 1.1). You consume it; you don't build it. The cluster is IPv6-primary with IPv6-only egress from the nodes (Egress-Only IGW, no NAT) — read 1.1's IPv6 decisions doc, because it directly shapes your hardest problem (see gotchas: getting the runner pod out to gitlab.com to register and pull jobs). Story 4.2 hits the same wall with ArgoCD — compare notes.
+	•	The team's default CI is GitHub Actions. Every other story deploys by pushing from GHA. You are the contrast: a second CI system, running on the cluster, that the team can reach for when it's the better fit.
+	•	Story 3.2 is your downstream consumer. The off-platform Versus build (3.2) runs its three-stage pipeline — build AMI / deploy infra / health check — on your runner, and you own the runner's IAM/security boundary that those jobs run under. 3.2's owner must be able to self-serve once your runner is up; 3.2's comparison memo defers the CI-system comparison to your decision doc, so it has to exist and be good.
+	•	This is a build-and-own story, not a cross-work normalization one. No four-phase observe/design/ship/decommission, no PRs into teammates' branches.
+Your work
+You own the runner and its security model end to end. The decisions below are yours to make and defend; the constraints that don't move are called out.
+GitLab account + project. Create a GitLab account and a project to register the runner against. This is the throwaway stand-in for what would be a company GitLab org in production (see the production note).
+The runner on EKS. Deploy the GitLab runner onto the cluster via its*Helm chart*, in a dedicated namespace, using the Kubernetes executor so each CI job runs in its own ephemeral pod. Configure it to run multiple jobs concurrently and prove that scaling works (parallel job pods, cleaned up when they finish). How you structure the chart values, namespace, and concurrency limits is your call — the cost guard below is the one fixed edge.
+Registration — runner authentication token, not the legacy flow. Register the runner with a runner authentication token (the{{glrt-}}-prefixed token created in the runners admin page). The older_registration-token_ flow was removed in GitLab 18.0 and now returns410 Gone — a lot of tutorials (and AI training data) still describe it, and following them is a guaranteed dead end. This is pinned because it's a fixed external reality, not a design choice. See the gotchas.
+The runner IAM/security boundary (you own this — it's graded). CI jobs need AWS access: a Terraform/infra pipeline needs to plan and apply; a container-app pipeline needs to build and push images. How CI jobs get AWS credentials, and how tightly that access is scoped, is your decision to make and defend. Scope it to what the pipelines actually do — not a broad admin role the runner could be turned into a foothold with. Prefer cluster-native identity (IRSA / Pod Identity on the job pods) over long-lived access keys stored in CI variables, and say why. This boundary is what Story 3.2's pipeline runs under, so design it for a real consumer, not just your demo job. Expect Story 1.2's owner to fold any ad-hoc role you mint into the canonical IAM scheme.
+The CI-system comparison doc (the graded heart — you drive this). A decision document for app-delivery teammates: how the GitHub Actions vs. GitLab CI choice actually gets made, grounded in what you built. The honest conclusion (see the production note) is that the choice is made at the ecosystem level, not per-pipeline — a team runs the CI that comes with its VCS, because paying for two platforms just for CI doesn't pencil out. Cover the GitLab vs. GitHub vs. Bitbucket landscape at a level an interviewer would respect — the real differentiator is the*bundle* (Atlassian/Jira/Confluence with Bitbucket; the full GitLab DevOps suite with GitLab CI; GitHub Actions/Projects with GitHub), the breadth of GitLab's built-in DevOps tooling (it aims at the whole lifecycle), and the fact that git itself doesn't change across providers — only the platform around it does. This is the artifact 3.2 leans on, so it has to stand on its own.
+Right-sizing (cost — non-negotiable). The runner and its job pods schedule onto the existing cluster nodes — no dedicated Karpenter NodePool, no new instance families spun up for this story. Cap concurrency to a sane dev number and make sure job pods are cleaned up when they finish so idle CI doesn't quietly hold capacity. Size the runner for a dev demo, not a busy team's CI fleet.
+Acceptance criteria
+	•	GitLab account + project created, with the runner registered to it via a runner authentication token (glrt-…), not the removed registration-token flow.
+	•	Runner deployed on the EKS cluster via Helm, in its own namespace, using the Kubernetes executor (jobs run in pods).
+	•	Concurrency demonstrated: the runner executes multiple jobs at once (parallel job pods), and the pods are cleaned up after they complete.
+	•	A demo CI job runs end to end through the runner on the team's cluster.
+	•	Runner IAM boundary is tight and documented: CI jobs get only the AWS access their pipelines need (Terraform/infra and container-app), via cluster-native identity rather than long-lived keys where possible, with the scoping decision written down and defensible.
+	•	Story 3.2 can run its pipeline on the runner without help from you — the runner + IAM boundary are documented well enough to self-serve.
+	•	CI-system comparison doc — how the GHA vs. GitLab CI choice is really made (ecosystem-level; no paying for both just for CI), with the GitLab/GitHub/Bitbucket VCS framing — that stands on its own (3.2's memo defers to it).
+	•	No GitLab-managed Terraform state — the project's state convention is S3 with native locking (see scaffold); GitLab's managed-state feature is a comparison talking point only, not something you wire up.
+	•	README with run instructions (incl. how the runner was bootstrapped and registered), the IAM boundary, scaling/maintenance notes, and issues faced.
+Deliverables
+	1	Runner manifests / Helm values + the registration setup, merged to main.
+	2	The runner IAM boundary (role[s] + trust + how job pods assume it) and the doc explaining the scoping.
+	3	CI-system comparison doc — GHA vs. GitLab CI, with the VCS landscape framing.
+	4	README — overview, how the runner was stood up and registered, the IAM boundary, scaling/maintenance, issues faced, run instructions.
+	5	WORKING-WITH-AI.md memoir.
+Demo (what you walk the PM through)
+	1	Whiteboard: why GitLab CI is in your portfolio at all (learning the other major player, not a real dual-CI end-state), and how orgs actually choose — the choice rides the VCS/ecosystem, and nobody pays for both platforms just for CI. The VCS bundle differences (Atlassian/Bitbucket, GitLab DevOps suite, GitHub) and that git itself doesn't change across providers.
+	2	Live: the runner registered and online in GitLab, and a CI job running as a pod on the team's cluster (kubectl get pods in the runner namespace while a job runs).
+	3	Live: concurrency — kick off multiple jobs and show parallel job pods spin up and get cleaned up.
+	4	Walk the IAM boundary: what AWS access a CI job gets, how it gets it (cluster-native identity vs. keys), and why it's scoped the way it is — framed as the boundary Story 3.2's pipeline runs under.
+	5	The production note: what's different doing this for real (GitLab as the VCS/org, billing, group-level shared runners) and why the slice you built still proves the skill.
+	6	Anything from the memoir (§3 what Claude got wrong, §4 what I verified) worth surfacing — especially the egress problem from the gotchas.
+Gotchas & references
+Read Story 4.1 — gotchas before you start, and keep it open while you work. It's a long list on purpose — the IPv6 egress problem alone (getting the runner pod out to{{gitlab.com}} from an IPv6-only cluster) is most of what separates ""the job went green"" from ""I understood what I shipped,"" and it's one of the best interview stories in this ticket. The more of these you hit and reason through, the better."
+"MRP25CCENT-15","Story","Story 4.2 — Kafka via ArgoCD","[MRP25CCENT-15] Story 4.2 — Kafka via ArgoCD Created: 01/Jun/26  Updated: 04/Jun/26
+Status:
+In Progress
+Project:
+MockRealProject - 25C - CentOS
+Fix versions:
+None
+
+Type:
+Story
+Priority:
+Medium
+Reporter:
+Bakhtiyar Shabdanov
+Assignee:
+iurie plesu
+Resolution:
+Unresolved
+Votes:
+0
+Labels:
+None
+
+Sprint:
+MRP25CCE Sprint 2
+
+ Description 
+ 
+Epic 4 — Alternative Paths. A build-and-own story: bring GitOps (ArgoCD) to a team that ships every other way, and run a real Kafka streaming pipeline through it. You are learning ArgoCD as you go — the curriculum hasn't taught it yet, so teaching it back is part of the deliverable.
+
+Working with AI on this project
+Read Working with AI first — it covers how to work with Claude Code, the subscription cap, and the standard deliverables (including the required WORKING-WITH-AI.md memoir). This ticket only adds the story-specific pieces.
+
+Story
+Problem statement
+Framing for the team: a (fictional) medical-device company needs a real-time pipeline for IoT sensor data. The rest of this platform deploys by pushing from CI (GitHub Actions applies manifests directly). You're introducing the *other model — GitOps with ArgoCD, where a controller in the cluster pulls from a git repo and continuously reconciles the live state to match it. Your PM (and a future interviewer) will ask ""why GitOps, and how is it different from what the rest of the team does?"" Have an answer — that contrast is the whole point of this story.*
+Stand up a Kafka streaming pipeline on the team's EKS cluster and deploy*all of it through ArgoCD* from a git manifests repo. The application code is provided — a producer (emits IoT sensor data), a*consumer* (reads Kafka, writes a database, exposes a REST API), and a*dashboard* (visualises the live data). Your job is the GitOps deployment and the data store, not writing the apps.
+This is not a ""get Kafka running"" story — it's a ""run a real workload the GitOps way, and be able to teach the team what GitOps is"" story. The*ArgoCD primer* you present to teammates and the self-healing / reconciliation behaviour you can demonstrate are the graded heart of it; Kafka is the realistic workload you prove it on.
+Production note (you will be asked to defend this). This story runs PostgreSQL in-cluster as a StatefulSet so the whole pipeline lives inside ArgoCD's reconciliation loop and stays self-contained. That is a deliberate teaching choice, not what you'd do in production: a real streaming sink belongs on a managed database (RDS/Aurora) for backups, failover, point-in-time recovery, and version upgrades you don't want to operate by hand inside Kubernetes. Be ready to say what you'd change for prod and why — that trade-off is interview gold, and pretending in-cluster state is ""production-ready"" is the wrong answer.
+What you're walking into
+Read the Day-0 scaffold every team starts from (repos, empty stubs, OIDC-only IAM, the manual cluster, Terraform conventions, PR rules). Specific to this story:
+	•	You run on the team's Terraform-managed EKS cluster (Story 1.1). You consume it; you don't build it. You rely on its EBS CSI driver for the persistent volumes Kafka and Postgres need — confirm it's there before you start. The cluster is IPv6-primary with IPv6-only egress from the nodes (Egress-Only IGW, no NAT) — read 1.1's IPv6 decisions doc, because it directly shapes your hardest problem (see gotchas: getting ArgoCD's repo-server and your image pulls out to the internet).
+	•	ArgoCD is not pre-taught. Unlike most of this project, the tool at the centre of your story isn't in the curriculum. You're learning it; budget for that, and turn what you learn into the primer deck.
+	•	The application code is provided at{{312school/kafka-streaming-platform}} (producer / consumer / dashboard). You containerise and deploy it — you don't author the app logic.
+	•	Your dashboard's public exposure tracks the team traffic plane, the same way the metrics/logging stacks do — adopted by you as 1.3/1.5 land, not received as cutover PRs (those target the app-delivery branches, and you're not one). See the gotchas for the contract and the don't-pre-build trap.
+	•	This is a build-and-own story, not a cross-work normalization one. No four-phase observe/design/ship/decommission, no PRs into teammates' branches.
+Your work
+You own the GitOps model end to end. The decisions below are yours to make and defend; the constraints that don't move are called out.
+ArgoCD. Install ArgoCD on the cluster and let it deploy everything else (an app-of-apps / ApplicationSet pattern pointing at your manifests repo). How ArgoCD itself gets bootstrapped is your call — but once it's up, the manifests repo is the source of truth: changes land by merging to that repo and letting ArgoCD reconcile, not by kubectl apply. Demonstrating that reconciliation — including self-heal when someone hand-edits a live resource — is a required outcome.
+Kafka (Strimzi). Deploy the Strimzi operator and a Kafka cluster through ArgoCD. Strimzi specifically — it's the team standard for running Kafka on Kubernetes, and the alternative free chart catalogs are no longer maintained. Run Kafka in KRaft mode (no ZooKeeper) — the modern Kafka topology. Brokers use EBS-backed PersistentVolumes via the cluster's EBS CSI driver. Order the bring-up with ArgoCD sync waves so the operator and the Kafka cluster are healthy before the apps that depend on them start.
+PostgreSQL, in-cluster. Run Postgres as a StatefulSet with an EBS-backed PVC — not RDS (see the production note above for why this is a teaching choice). It's the consumer's sink and the dashboard's read source. The database credentials must not sit in plaintext in the manifests repo — how you keep a secret out of git while still deploying via GitOps (sealed-secrets, SOPS, or the project's Secrets Manager CSI driver from 1.5) is your decision to make and defend.
+The apps. Containerise the provided producer / consumer / dashboard (write the Dockerfiles), build and push images to ECR from GitHub Actions tagged by git SHA, and deploy them via ArgoCD. The pipeline must actually flow: producer → Kafka → consumer → Postgres → dashboard, with the dashboard showing live data at{{kafka-dashboard-<TEAM>-dev.<TEAM_DOMAIN>}}. Everything lives in a{{kafka}} namespace.
+Right-sizing (cost — non-negotiable). This runs on the team's real dev bill. Kafka and Postgres schedule onto the existing cluster nodes — no dedicated Karpenter NodePool, no new instance families spun up for this story. Size brokers and PVs for a dev demo, not production throughput (modest CPU/memory requests, small EBS volumes), and run a*single Postgres replica*. A replicated 3-broker KRaft cluster is the realistic minimum to show Kafka's shape — keep the per-broker footprint small and justify whatever broker count you pick. Define{{staging}}/production values for completeness, but only dev deploys (project convention).
+Acceptance criteria
+	•	ArgoCD installed, with an app-of-apps / ApplicationSet pointed at your manifests repo; all Applications report Healthy & Synced.
+	•	Reconciliation demonstrated live: a change merged to the manifests repo rolls out without kubectl apply, and a manual edit to a live resource is reverted by ArgoCD (self-heal).
+	•	Strimzi Kafka running in KRaft mode (no ZooKeeper pods), on*EBS-backed PVs*, on the existing nodes (no dedicated NodePool), dev-sized per Your work.
+	•	Sync waves order the bring-up so the operator + Kafka (and Postgres) are healthy before the consumer/dashboard start.
+	•	PostgreSQL runs in-cluster as a StatefulSet with a PVC — not RDS.
+	•	No credentials in plaintext anywhere in the manifests repo; the secret-delivery mechanism you chose is documented and defensible.
+	•	Images built and pushed to ECR from GitHub Actions (git-SHA tags) and deployed by ArgoCD.
+	•	The pipeline flows end to end: producer emitting IoT data → consumer persisting to Postgres → dashboard showing live data at{{kafka-dashboard-<TEAM>-dev.<TEAM_DOMAIN>}} over the internet.
+	•	Dashboard exposure tracks the traffic plane: HTTP via scaffold ingress in week 1; HTTPRoute on the team Gateway once 1.3 lands; TLS + external-dns once 1.5 lands.
+	•	ArgoCD primer (deck or doc) + a ~15-min teammate walkthrough of what GitOps is and how it differs from the team's push-deploy model.
+	•	README with a sync-wave diagram, issues faced, and run instructions (incl. how ArgoCD was bootstrapped).
+Deliverables
+	1	Manifests repo — ArgoCD Application/ApplicationSet set, Strimzi + Kafka manifests, the Postgres StatefulSet, and the app manifests, ordered with sync waves.
+	2	ArgoCD install/bootstrap config.
+	3	Dockerfiles for producer / consumer / dashboard + the GitHub Actions image build-and-push-to-ECR workflow.
+	4	README — overview, sync-wave/architecture diagram, the secret handling decision, issues faced, run instructions.
+	5	WORKING-WITH-AI.md memoir.
+	6	ArgoCD primer (deck/doc) you present to teammates (~15 min).
+Demo (what you walk the PM through)
+	1	Whiteboard: what GitOps is, pull-vs-push reconciliation, and why it differs from how the rest of the team deploys — grounded in this project, not generic slides. Why sync waves matter here.
+	2	Live: the ArgoCD UI — the app-of-apps tree, everything Healthy & Synced.
+	3	Live: reconciliation — merge a change to the manifests repo and watch it roll out; then hand-edit a live resource and watch ArgoCD put it back (self-heal).
+	4	Live: the pipeline — producer → Kafka → consumer → Postgres → dashboard, with live data updating at the URL.
+	5	Show Kafka is KRaft (no ZooKeeper), the brokers' EBS PVs, and the Postgres StatefulSet + PVC — all on the existing nodes.
+	6	How the Postgres credential reaches the pods without living in git.
+	7	The production note: what you'd change to run this for real (managed DB, dedicated nodes) and why you didn't here.
+	8	Anything from the memoir (§3 what Claude got wrong, §4 what I verified) worth surfacing — especially the egress problem from the gotchas.
+Gotchas & references
+Read Story 4.2 — gotchas before you start, and keep it open while you work. It's a long list on purpose — the IPv6 egress problem alone (getting ArgoCD's git sync and your image pulls out of an IPv6-only cluster) is most of what separates ""the demo worked"" from ""I understood what I shipped,"" and it's the single best interview story in this ticket. The more of these you hit and reason through, the better."
+"MRP25CCENT-17","Story","Story 5.2 — Claude PR review task","[MRP25CCENT-17] Story 5.2 — Claude PR review task Created: 01/Jun/26  Updated: 03/Jun/26
+Status:
+To Do
+Project:
+MockRealProject - 25C - CentOS
+Fix versions:
+None
+
+Type:
+Story
+Priority:
+Medium
+Reporter:
+Bakhtiyar Shabdanov
+Assignee:
+Tina
+Resolution:
+Unresolved
+Votes:
+0
+Labels:
+None
+
+Sprint:
+MRP25CCE Sprint 2
+
+ Description 
+ 
+Epic 5 — AI Ops. A build-and-own story: stand up the team's secondary AI PR reviewer across every repo the team works in, so on every PR it reviews the diff against the story's Jira ticket and drafts line comments, a requirements-met checklist, and demo Q&A. How you build it is your call to research and defend; the review prompt and those three bespoke outputs — tuned until they're useful, not noisy — are the graded heart.
+
+Working with AI on this project
+Read Working with AI first — it covers how to work with Claude Code, the subscription cap, and the standard deliverables (including the required WORKING-WITH-AI.md memoir). This ticket only adds the story-specific pieces.
+
+Story
+Problem statement
+Framing for the team: every PR on this project is supposed to be checked against the Jira ticket it claims to implement — but a human reviewer skims the diff and rarely re-reads the acceptance criteria line by line. Your job is to build the team's *secondary reviewer that does exactly that — automatically, on every PR, in every repo the team works in, so no one's work ships unreviewed by it. Your PM (and a future interviewer) will ask the hard version: ""you wired up an AI reviewer — so what makes its output worth reading instead of noise everyone learns to scroll past?"" The answer is the review prompt and how you tuned it, and that's what's graded.*
+Build the team's AI PR reviewer so that, on PR open, it reviews the diff*against the story's Jira ticket, resolved from the ticket key in the PR description*, and drafts three things: (a) line-level review comments, (b) a requirements-met checklist scored against that ticket's acceptance criteria, and (c) a set of demo Q&A questions the PM can use later. How you implement it is yours to research and defend — the ticket pins the outcome (a useful, ticket-grounded review on every PR in every team repo), not the mechanism. Your graded work is the review prompt and those three bespoke outputs.
+What you're walking into
+Read the Day-0 scaffold every team starts from (repos, empty stubs, OIDC-only IAM, the manual cluster, Terraform conventions, PR rules). Specific to this story:
+	•	The ""how"" is open — research it before you build. This is a recent, fast-moving corner of the tooling; there are off-the-shelf ways to wire GitHub up to Claude and there's the do-it-yourself route. Part of the work is finding out what exists, deciding what to use, and being able to say why. The ticket does not name a tool — that's your research and your defense (the gotchas point you at the landscape and at the trap of sinking your time into plumbing instead of the prompt).
+	•	It reviews against the Jira ticket, not in a vacuum. The PR description carries the Jira ticket key; the reviewer resolves it, fetches the ticket, and feeds the ticket text plus the PR diff into the review prompt. The requirements-met checklist scores the diff against that ticket's acceptance criteria — that grounding is what makes the review specific instead of generic.
+	•	It runs everywhere the team works. The reviewer isn't a one-repo demo: it has to be installed across every repo the team owns work in — the infra repo and each app-delivery repo — so every teammate's PR gets reviewed. That means landing your setup into repos other people own and sorting out the shared Anthropic API key as a secret in each (or once, at the owner level). Coordinate it the way the platform stories coordinate their cross-repo changes — see the gotchas.
+	•	You have week-1 work before any teammate's PR exists. Build and pre-tune against historical PRs (past batches) or sample PRs you construct. The real tuning — and the ""useful on real PRs"" bar — is the ships-later half, against the team's actual PRs across all the repos as they open. You are not idle waiting for them.
+	•	This is the program-wide reviewer in miniature. A program-wide version (across every team) is the coordinator's; yours covers your team's repos and demonstrates the same skill.
+Your work
+The decisions below are yours to make and defend; the constraints that don't move are called out.
+Coverage — every team repo, on PR open (non-negotiable). The reviewer runs on every repo the team has work in (infra + each app repo), so no PR ships without it. Trigger it on PR open and gate it (e.g. labels) so it isn't re-firing on every commit — that's a noise and a cost control, because the shared 312 Anthropic API key (from the coordinator, Bakhtiyar) is real spend and never committed. Getting it into repos other teammates own, and the key wired in each, is a coordination job — own it.
+Resolve the Jira ticket from the PR description. The reviewer pulls the ticket key from the PR description, fetches the ticket, and works the ticket text plus the PR diff into the review. How it fetches — a step that injects the ticket, a Jira tool the model calls itself, Story 5.3's Atlassian MCP — is your call. Decide what happens when the key_can't_ resolve (missing, typo, closed ticket): degrade gracefully, don't post garbage.
+The review prompt — the graded heart. This is the product. A generic ""review this PR"" prompt yields plausible nitpicks teammates learn to ignore. Yours has to be specific: what to flag vs. what to ignore, and how strictly to score the requirements checklist against the ticket's acceptance criteria (over-strict fails everything; over-lenient rubber-stamps). You tune it against real PRs until the output is useful, not noisy — and you keep a prompt-tuning log of what you tried, what worked, and what didn't. The honest narrative is that you spent more time on the prompt than on the wiring.
+The three bespoke outputs, posted as a PR comment:
+	•	Line-level review comments on the diff.
+	•	A requirements-met checklist scored against the resolved ticket's acceptance criteria — the part that makes this more than a linter.
+	•	Demo Q&A — the ""stakeholder questions you should be ready for"" drafts, written for a different reader (the PM / a teammate prepping their demo), not the PR author.
+Acceptance criteria
+	•	Installed across every repo the team works in (infra + each app repo), triggered on PR open and gated so it doesn't re-fire on every commit; the Anthropic API key is a secret, never committed.
+	•	Implementation choice is defended — you can say what you used, what you considered, and why (the ticket doesn't pin a tool).
+	•	Resolves the Jira ticket from the PR description — extracts the key, fetches the ticket — and scores the diff against that ticket's acceptance criteria; degrades gracefully when no ticket resolves.
+	•	Posts all three outputs as a PR comment: line-level comments, a requirements-met checklist, and demo Q&A.
+	•	Runs on at least 5 real PRs across the team's repos, correctly resolving each PR's ticket and scoring against its criteria.
+	•	PM agrees the output was useful in at least 3 of those.
+	•	The demo-Q&A draft is in use by at least one teammate prepping their demo.
+	•	Prompt-tuning log — what you tried, what worked, what didn't, and how the output got less noisy.
+	•	README with issues faced, the implementation you chose (and why), and how the reviewer + prompt are wired across the repos.
+Deliverables
+	1	The reviewer config — the workflow(s) installed in each repo, the ticket-resolution piece, and your review prompt files.
+	2	Prompt-tuning log — the iteration record (the graded judgment artifact, like 5.1's autonomy memo / 5.3's security model).
+	3	README — overview, the implementation you chose and why, how it's wired across the team's repos, issues faced.
+	4	WORKING-WITH-AI.md memoir.
+Demo (what you walk the PM through)
+	1	Whiteboard: why a secondary AI reviewer at all, the implementation you chose and what you rejected, and the prompt-design story — what you ask Claude to find vs. ignore, and how you score the requirements checklist against a ticket. Show the prompt-tuning log: noisy first draft → useful.
+	2	Live: open a PR (or re-run on a real one); watch the reviewer resolve the Jira ticket from the description and post the three outputs — and show it's live in more than one of the team's repos, not just one.
+	3	Show the requirements-met checklist scored against the ticket's acceptance criteria — and a case where it correctly flags a missing requirement.
+	4	Show the demo Q&A a teammate actually used to prep, and the graceful-degrade path when a PR has no resolvable ticket.
+	5	Show the API key is a secret, not in git.
+	6	Anything from the memoir (§3 what Claude got wrong, §4 what I verified) worth surfacing.
+Gotchas & references
+Read Story 5.2 — gotchas before you start, and keep it open while you work. It's a long list on purpose — the prompt-tuning (useful vs. noisy), the brittle ticket resolution, the honest-scoring problem, and the shared-API-key cost discipline are most of what separates ""the reviewer ran"" from ""the team actually reads its output,"" and they're the best interview material in this ticket. The more of these you hit and reason through, the better."
+"MRP25CCENT-18","Story","Story 5.3 — Platform MCP suite","[MRP25CCENT-18] Story 5.3 — Platform MCP suite Created: 01/Jun/26  Updated: 03/Jun/26
+Status:
+To Do
+Project:
+MockRealProject - 25C - CentOS
+Fix versions:
+None
+
+Type:
+Story
+Priority:
+Medium
+Reporter:
+Bakhtiyar Shabdanov
+Assignee:
+Unassigned
+Resolution:
+Unresolved
+Votes:
+0
+Labels:
+None
+
+Sprint:
+MRP25CCE Sprint 2
+
+ Description 
+ 
+Epic 5 — AI Ops. A build-and-own story: give the team's Claude Code a least-privilege way to read the platform and act on it through MCP (Model Context Protocol) servers — and own the security model for what an AI agent is allowed to touch. The servers are mostly off-the-shelf; the design of who can connect and what each one can do is the graded heart.
+
+Working with AI on this project
+Read Working with AI first — it covers how to work with Claude Code, the subscription cap, and the standard deliverables (including the required WORKING-WITH-AI.md memoir). This ticket only adds the story-specific pieces.
+
+Story
+Problem statement
+Framing for the team: your teammates already use Claude Code on this project. Your job is to make it talk to the team's own platform directly — read Grafana/Prometheus/the cluster, log progress to Jira, spin up a test pod on request — instead of everyone copy-pasting{{kubectl}} output into a chat. Your PM (and a future interviewer) will ask the hard version: ""*you've handed an AI agent a button that can change the live cluster — what stops it, or a leaked token, from doing damage?"" The security model is your answer, and it's what's graded.*
+Stand up the team's MCP layer: one read-only data MCP and one mutating MCP, callable from any team member's Claude Code, demonstrated against real tasks. This is not a ""write two servers"" story — where an official server already exists, you install, deploy, secure, and operate it; you build your own only where no official server covers the need. The two auth boundaries you design — who may connect to each server, and what each server is itself allowed to do — are the graded deliverable; the servers are the realistic thing you prove them on.
+What you're walking into
+Read the Day-0 scaffold every team starts from (repos, empty stubs, OIDC-only IAM, the manual cluster, Terraform conventions, PR rules). Specific to this story:
+	•	The cluster-hosted server runs on the team's EKS cluster (Story 1.1). You consume it; you don't build it. The cluster is*IPv6-primary with IPv6-only egress* from the nodes — read 1.1's IPv6 decisions doc, because it shapes anything your server calls out to at runtime (see gotchas).
+	•	Your read-only MCP is local and unblocked. The read-only data MCP runs as a local stdio server in each member's Claude Code config — no cluster hosting, real week-1 work that waits on nothing. The*mutating MCP* is the in-cluster, security-heavy piece (deployment + public URL + the two auth boundaries).
+	•	MCP is recent and not pre-taught. Like ArgoCD on 4.2, the tooling at the centre of your story isn't in the curriculum — budget for learning it, and turn what you learn into the security model doc.
+	•	This is a build-and-own story, not a cross-work normalization one. No four-phase observe/design/ship/decommission, no PRs into teammates' branches. Your cluster-hosted server's public exposure tracks the team traffic plane (1.3/1.5) and you adopt it yourself — it is not sent to you as a cutover PR (those target the 3.x app-delivery branches, and you're not one). See the gotchas for the contract.
+Your work
+The decisions below are yours to make and defend; the constraints that don't move are called out.
+What you deliver: exactly two MCPs — one read-only data MCP and*one mutating MCP*. For each, use the official server if one exists (Grafana, Prometheus, Atlassian/Jira, and Kubernetes all ship MCP servers today); only build your own where no official server covers the need. Reinventing a shipped server burns the time the security model and the MCP-vs-CLI case deserve.
+Read-only data MCP — local stdio. Pick one: a Grafana, Prometheus, or kubectl-read MCP. Runs in each member's Claude Code config. Choose with the dependency in mind: a Grafana/Prometheus MCP needs 2.1's stack to exist first; a kubectl-read MCP works against the cluster from day one.
+Mutating MCP — cluster-hosted, in-cluster. This is the security-heavy one, and it's deliberately the cluster kind — e.g. a ""spin me a test pod"" server — because that's where the hosting and the two auth boundaries live. Build one (to own its scope) or deploy an official Kubernetes MCP and scope it — either way you own its blast radius. It's a Deployment + Service in the cluster; if you build a server, its image goes to ECR from GitHub Actions (git-SHA tags). (A_SaaS_ mutating MCP — say a Jira progress logger over the official Atlassian MCP — would run local and skip all the hosting and auth work, which is exactly why your required mutating MCP is the cluster one. Wire a SaaS one too if you want, but it doesn't substitute.)
+MCP vs CLI — research it and make the case. An MCP is not automatically better than the tool it wraps. For each MCP you deliver, work out when it actually beats just running the CLI — and where it doesn't (added latency, one more moving part to secure, drift from the underlying tool). This goes in your docs and you argue it in the demo; ""I wrapped kubectl because I could"" is not the answer.
+Two auth boundaries — the graded heart. Design and document both:
+	•	Client → MCP (how teammates reach the cluster-hosted server): a*bearer token checked at the edge is the required baseline* — each teammate adds the remote server to Claude Code with a bearer header; the server URL can live in the team's project-scoped .mcp.json, but the token comes from an env var and is never committed. An OAuth flow (oauth2-proxy in front of an IdP) is more secure but more complex — flag it as the stronger alternative; it is not required.
+	•	MCP → platform (what the server may do): a tightly-scoped Kubernetes ServiceAccount + RBAC Role (e.g. create pods in one namespace, nothing cluster-wide), plus IRSA / Pod Identity with a tight policy for any AWS call — never *. Credentials live server-side, never on a laptop.
+Traffic plane for the cluster-hosted server is yours to own. You write the HTTPRoute and wire the TLS cert yourself, coordinating with the 1.3 and 1.5 owners — see the gotchas for the contract. Reachable at{{mcp-<TEAM>-dev.<TEAM_DOMAIN>}}.
+Cost — bound what the agent can create (non-negotiable). The mutating MCP's whole job is creating cluster resources on request — so a careless prompt or a leaked token could create big or many of them and run up the team's real dev bill. Cap it: resource limits and a namespace quota on what it's allowed to create, so the blast radius has a cost ceiling, not just a permissions one. (The server itself is a single small pod on the existing nodes — that part's negligible; the spend risk is in what it creates.)
+Acceptance criteria
+	•	Two MCPs callable from any team member's Claude Code: a read-only data MCP and a (cluster-hosted) mutating MCP.
+	•	Read-only data MCP runs as a local stdio server and is demoed against real tasks.
+	•	Mutating MCP deployed in-cluster, on the existing nodes, reachable at mcp-<TEAM>-dev.<TEAM_DOMAIN> over the internet,behind a bearer-token check — no unauthenticated mutating endpoint exposed.
+	•	Least privilege proven: the mutating server runs under a scoped ServiceAccount that can do only what it's meant to (show an out-of-scope action being denied by RBAC), with IRSA/Pod Identity for any AWS call, and a resource-limit / quota ceiling so it can't run up the bill with what it creates.
+	•	MCP-vs-CLI case made in the docs and in the demo: for each MCP, where it beats the CLI and where it doesn't.
+	•	No tokens or credentials in plaintext in any repo — server URL in .mcp.json, token from an env var.
+	•	Exposure tracks the traffic plane, written by you: HTTP via scaffold ingress in week 1; HTTPRoute on the team Gateway once 1.3 lands; TLS + external-dns once 1.5 lands — authored by you in coordination with 1.3/1.5, not received as a cutover PR.
+	•	Security model doc: the two auth boundaries, a per-MCP blast-radius analysis (""what could this do if the token leaked""), and the token issuance / rotation / revocation story.
+	•	At least 3 real-task demonstrations recorded that show the MCPs saving time vs. running the tool by hand.
+	•	README with issues faced and per-MCP install instructions.
+Deliverables
+	1	The mutating MCP — your server code (if you built one) or the deployment config for the official server you deployed — plus its*Kubernetes manifests* (Deployment, Service, ServiceAccount, RBAC, HTTPRoute) and, if you built it, the GitHub Actions image build-and-push-to-ECR workflow.
+	2	Install instructions / .mcp.json entries for both MCPs (the local read-only one and the cluster-hosted mutating one).
+	3	Security model doc — the two auth boundaries + per-MCP blast-radius analysis (including the create-cost ceiling) + token rotation/revocation.
+	4	README — overview, the MCP-vs-CLI case for each MCP, issues faced, run/install instructions.
+	5	WORKING-WITH-AI.md memoir.
+	6	Demo recording — 3 real tasks.
+Demo (what you walk the PM through)
+	1	Whiteboard: the two auth boundaries and the blast-radius framing (""what stops the agent, or a leaked token, doing damage?""), and the*MCP-vs-CLI case* — why an MCP at all, where it beats the CLI and where it doesn't.
+	2	Live: the read-only MCP answering a real question, vs. running the tool by hand — the concrete time it saves (your MCP-vs-CLI evidence).
+	3	Live: the mutating MCP creating a test pod over its team URL with a bearer token — then attempt an out-of-scope action and watch RBAC deny it, and show the create-cost cap.
+	4	Show the token is not in git, and how you'd rotate / revoke it.
+	5	The traffic plane: HTTP → HTTPRoute → TLS as 1.3/1.5 landed, written by you in coordination with their owners.
+	6	Anything from the memoir (§3 what Claude got wrong, §4 what I verified) worth surfacing.
+Gotchas & references
+Read Story 5.3 — gotchas before you start, and keep it open while you work. It's a long list on purpose — the auth boundaries, the ""the edge doesn't validate your bearer token for you"" trap, and the least-privilege RBAC scoping are most of what separates ""the demo worked"" from ""I designed something I'd let near a real cluster,"" and they're the best interview material in this ticket. The more of these you hit and reason through, the better."
