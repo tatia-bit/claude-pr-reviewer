@@ -134,10 +134,17 @@ jobs:
           gh pr diff "${{ github.event.pull_request.number }}" --patch > DIFF.patch
           echo "DIFF.patch: $(wc -l < DIFF.patch) lines"
 
+      # `github_token` is passed deliberately. Omit it and the action authenticates
+      # as the Claude GitHub App, which must then be installed on every reviewed
+      # repository and carries Contents/Issues/Discussions/Actions/Workflows
+      # read-write across them. This reviewer needs none of that: it reads the
+      # checked-out repo, and the posting step below uses the workflow's own token.
+      # Supplying GITHUB_TOKEN keeps it inside the permissions the caller declares.
       - name: Review
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           prompt: |
             Follow the instructions in .reviewer/prompt/review-prompt.md exactly.
 

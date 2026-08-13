@@ -70,6 +70,13 @@ jobs:
     secrets: inherit
 ```
 
+**No GitHub App install is needed.** `claude-code-action` authenticates as the
+Claude GitHub App when `github_token` is omitted, which would require installing
+that App on every reviewed repository, with Contents / Issues / Discussions /
+Actions / Workflows read-write across them. This workflow passes the caller's own
+`GITHUB_TOKEN` instead, so the reviewer is confined to the permissions below and
+there's nothing to install per repo.
+
 **All four permissions are required**, and they must be set on the caller — a
 reusable workflow can never hold more permission than the workflow calling it.
 `id-token: write` is the non-obvious one: `claude-code-action` exchanges the
