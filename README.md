@@ -58,6 +58,8 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  issues: write
+  id-token: write
 
 jobs:
   review:
@@ -67,6 +69,14 @@ jobs:
     uses: tatia-bit/claude-pr-reviewer/.github/workflows/review.yml@main
     secrets: inherit
 ```
+
+**All four permissions are required**, and they must be set on the caller — a
+reusable workflow can never hold more permission than the workflow calling it.
+`id-token: write` is the non-obvious one: `claude-code-action` exchanges the
+workflow's OIDC token to authenticate as the Claude GitHub App, and without it the
+action fails with `Could not fetch an OIDC token`. `issues: write` covers the
+posting script's fallback path, which comments through the issues endpoint when a
+review carrying line anchors is rejected.
 
 Then add two secrets and two variables:
 
