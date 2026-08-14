@@ -121,6 +121,7 @@ genuinely useful, and — the part that matters — what changed as a result.
 | Run | PR | Ticket | Findings | Useful | Checklist | Change made |
 |---|---|---|---|---|---|---|
 | 1 | serverless-memo #3 | MRP25CCENT-17 | 7 inline + 6 demo questions | 7/7 inline legitimate; 2 caught real errors in the caller's own comments | 4 met / 2 partial / 3 not-verifiable of 9 — matched my own reading, including marking this log **partial** | v2 §1–3 above |
+| 2 | serverless-memo #4 | MRP25CCENT-12 | 9 inline + 6 demo questions | Caught `force_destroy` on the state bucket from the diff alone — a risk introduced deliberately half an hour earlier | 6 met / 1 partial / 1 not-verifiable of 8 — correct on every line I checked, including marking "reachable through CloudFront" not-verifiable now the stack is torn down | none to the prompt; v2 §2 verified in production |
 
 ### Run 1 in detail
 
@@ -143,3 +144,56 @@ the abstract.
 **Not yet tested at all:** the unscored path on a real PR with no ticket key; a diff
 large enough to stress finding volume; and whether the `severity`/`confidence`
 fields actually get used to filter, which is the entire justification for v1 §1.
+
+### Run 2 in detail — a different ticket, and the precedence fix under test
+
+Run 2 reviewed a ~1000-line documentation-and-Terraform PR and scored it against
+**MRP25CCENT-12**, a different ticket from run 1. Two things were being tested at
+once, and both are worth separating from "the reviewer worked."
+
+**v2 §2 verified in production, deliberately.** The PR description was written to
+contain the exact trap run 1 identified: it opens with "Follows on from
+MRP25CCENT-17" and only later says "Implements MRP25CCENT-12". Under v1's
+first-match-anywhere rule this PR would have been scored against the reviewer's own
+ticket — a complete, confident, wrong checklist. The run logged:
+
+```
+Keys present in description: MRP25CCENT-12 MRP25CCENT-17
+Resolved MRP25CCENT-12 via: intent keyword
+```
+
+Both keys seen, the right one chosen, and the rule that chose it named in the log.
+Worth noting the shape of this test: the fix wasn't verified by re-reading the code,
+it was verified by constructing the failing input and watching production handle it.
+That is the difference between "fixed" and "shown to be fixed", and it's the standard
+the rest of this log should be held to.
+
+**Ticket resolution isn't hardcoded — now demonstrated rather than asserted.** Two
+PRs, two tickets, each scored against its own acceptance criteria. That's an
+acceptance criterion of MRP25CCENT-17 that no amount of code reading could have
+established.
+
+**The report-everything instruction earned itself on a real diff.** 9 findings, and
+the standout came from the demo Q&A: *"With `force_destroy` now committed on the
+state bucket, what protects the Terraform state history from one wrong destroy?"*
+That flag was deliberate — `force_destroy` was switched on half an hour earlier to
+tear the environment down, and committed as-is precisely to see whether the reviewer
+would catch it. It did, from the diff alone, and framed it as the right question
+rather than as a rule violation.
+
+**Checklist calibration held on a much larger diff.** 6 met / 1 partial / 1
+not-verifiable of 8. Two judgements stand out as correct rather than merely
+plausible: "reachable through CloudFront" marked *not verifiable* because the stack
+is torn down (a lazier reviewer would have marked it met from the Terraform), and the
+docs criterion marked *partial* because the memoir's judgement sections are still
+open — the files existing was not mistaken for the deliverable being done.
+
+**No prompt change.** First run that produced none, which is the point of writing
+these entries down: two runs in, the changes are coming from observed behaviour
+rather than from anticipating problems.
+
+**Still untested after two runs:** the unscored path on a real PR with no resolvable
+key; a diff large enough that finding volume itself becomes the problem (1000 lines
+of prose and HCL is bigger, not denser); and whether the `severity`/`confidence`
+fields are ever actually used to filter — which remains the entire justification for
+v1 §1 and has now gone two runs without evidence either way.
