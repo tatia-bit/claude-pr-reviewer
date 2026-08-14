@@ -79,11 +79,17 @@ there's nothing to install per repo.
 
 **All four permissions are required**, and they must be set on the caller — a
 reusable workflow can never hold more permission than the workflow calling it.
-`id-token: write` is the non-obvious one: `claude-code-action` exchanges the
-workflow's OIDC token to authenticate as the Claude GitHub App, and without it the
-action fails with `Could not fetch an OIDC token`. `issues: write` covers the
-posting script's fallback path, which comments through the issues endpoint when a
-review carrying line anchors is rejected.
+`id-token: write` is the non-obvious one: the action requests an OIDC token during
+setup, and without it the first live run failed with `Could not fetch an OIDC
+token`. `issues: write` is needed only when posting a *review* fails outright — no
+parseable `review.json`, or the reviews endpoint erroring — in which case the
+script falls back to a plain issue comment.
+
+**`@main` and `secrets: inherit` are an accepted risk, stated rather than hidden.**
+A caller pinned to `@main` picks up prompt changes on its next run with no bump,
+which is the point; it also means a change here runs against that repo's secrets.
+With a single owner across both repos the trust boundary is that one account. A
+team should pin a commit SHA and forward only the secrets the reviewer needs.
 
 Then add two secrets and two variables:
 

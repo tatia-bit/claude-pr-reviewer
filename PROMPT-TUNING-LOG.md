@@ -70,12 +70,76 @@ wrong. That's a real trade-off accepted for auth reasons, not a design ideal.
 
 ---
 
+## v2 — after run 1
+
+Three changes, all caused by the first real output rather than anticipated.
+
+### 1. Require claims to be grounded in evidence. **(fixes an observed error)**
+
+Run 1's demo Q&A asserted that an exhausted token "fails the run before the
+posting step can explain itself." That is false, and disprovably so: the posting
+step runs on `if: always()`, and two `## Claude review — failed` comments from
+earlier failed runs were sitting on the very PR being reviewed. The model reasoned
+about a failure path from the diff instead of checking evidence already in front of
+it.
+
+This is the failure mode worth guarding against, because it is *confident* and
+plausible — far more damaging in a review than a missed nit. The prompt now
+requires claims about runtime behaviour to be checked against the repository and
+the PR's own history, and requires any claim that couldn't be checked to say so.
+
+### 2. Ticket resolution takes the strongest signal, not the first match. **(fixes a real defect)**
+
+Run 1's own demo Q&A caught this: key extraction took the first `PROJ-123`-shaped
+match anywhere in the PR body, so a description opening with "follows on from
+MRP25CCENT-9" would have scored the diff against the wrong ticket's criteria — a
+full, confident, wrong checklist. Worse than the no-ticket path, which at least
+labels itself unscored.
+
+Now a precedence chain: a Jira browse link, then an intent keyword
+(`implements` / `closes` / `fixes` / `resolves` / `part of`), then a key at the
+start of a line, then a bare match as a last resort. The run logs every key found
+and which rule matched, so a mis-resolution is visible rather than silent. Not a
+prompt change — but found by the prompt, which is the point.
+
+### 3. Trigger and permission corrections. **(found by the reviewer, in its own caller)**
+
+Run 1 flagged, correctly: `opened` fires for draft PRs, so a draft opened for early
+feedback spent a full review; a PR created with the label already applied fires
+both `opened` and `labeled`; and two of the caller's own justification comments were
+inaccurate — the `issues: write` rationale described the wrong fallback path, and
+the `id-token` rationale still cited GitHub App authentication after we'd switched
+to passing `github_token` explicitly. All fixed in the caller.
+
+---
+
 ## Runs
 
-Filled in as the reviewer runs on real PRs. What to capture each time: which PR,
-which ticket, how many findings, how many were genuinely useful, and — the part
-that matters — what in the prompt you changed as a result.
+What to capture each time: which PR, which ticket, how many findings, how many were
+genuinely useful, and — the part that matters — what changed as a result.
 
-| Run | PR | Ticket | Findings | Useful | Checklist accuracy | Change made |
+| Run | PR | Ticket | Findings | Useful | Checklist | Change made |
 |---|---|---|---|---|---|---|
-| | | | | | | |
+| 1 | serverless-memo #3 | MRP25CCENT-17 | 7 inline + 6 demo questions | 7/7 inline legitimate; 2 caught real errors in the caller's own comments | 4 met / 2 partial / 3 not-verifiable of 9 — matched my own reading, including marking this log **partial** | v2 §1–3 above |
+
+### Run 1 in detail
+
+**What went right.** The checklist was well calibrated. It refused to score "PM
+agrees the output was useful" and named the evidence a human would need instead,
+and it marked this log *partial* on the grounds that it "records what was decided,
+not what was tried" — which was exactly true at the time.
+
+**The report-everything instruction did not produce noise here** — 7 findings on a
+26-line workflow file, all legitimate, two of them errors in comments I wrote
+myself. A genuine result, but a weak test: this diff was dense configuration where
+nearly every line carries an edge case. The instruction still needs testing against
+a large, code-heavy diff, where volume is the real risk.
+
+**What went wrong.** One confidently false claim about the failure path (§1). The
+shape of the error matters more than the error: not a hallucinated fact, but a
+plausible inference it didn't check. So the fix targets *checking*, not accuracy in
+the abstract.
+
+**Not yet tested at all:** the unscored path on a real PR with no ticket key; a diff
+large enough to stress finding volume; and whether the `severity`/`confidence`
+fields actually get used to filter, which is the entire justification for v1 §1.

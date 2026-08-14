@@ -83,9 +83,44 @@ jobs:
         run: |
           set -uo pipefail
 
-          KEY=$(printf '%s' "${PR_BODY:-}" \
-                | grep -oE '[A-Z][A-Z0-9]+-[0-9]+' \
-                | head -1 || true)
+          # Which key, when a description mentions several? Taking the first match
+          # anywhere is wrong: a body opening with "follows on from MRP25CCENT-9"
+          # would be scored confidently against the wrong ticket's criteria — worse
+          # than the no-ticket path, which at least labels itself unscored. So
+          # prefer the forms that state intent, and fall back to a bare match only
+          # when nothing more specific exists. The matched rule is logged so a
+          # mis-resolution is visible in the run rather than silent.
+          BODY="${PR_BODY:-}"
+          KEY=""; RULE=""
+
+          # 1. A Jira link — the least ambiguous signal.
+          KEY=$(printf '%s' "$BODY" | grep -oE '/browse/[A-Z][A-Z0-9]+-[0-9]+' \
+                | grep -oE '[A-Z][A-Z0-9]+-[0-9]+' | head -1 || true)
+          [ -n "$KEY" ] && RULE="Jira browse link"
+
+          # 2. An explicit statement of intent.
+          if [ -z "$KEY" ]; then
+            KEY=$(printf '%s' "$BODY" \
+                  | grep -oiE '(implements|closes|fixes|resolves|part of)[[:space:]:]+[A-Z][A-Z0-9]+-[0-9]+' \
+                  | grep -oE '[A-Z][A-Z0-9]+-[0-9]+' | head -1 || true)
+            [ -n "$KEY" ] && RULE="intent keyword"
+          fi
+
+          # 3. A key at the start of a line (e.g. a title line or checklist entry).
+          if [ -z "$KEY" ]; then
+            KEY=$(printf '%s' "$BODY" | grep -oE '^[A-Z][A-Z0-9]+-[0-9]+' | head -1 || true)
+            [ -n "$KEY" ] && RULE="start of line"
+          fi
+
+          # 4. Anything key-shaped, anywhere.
+          if [ -z "$KEY" ]; then
+            KEY=$(printf '%s' "$BODY" | grep -oE '[A-Z][A-Z0-9]+-[0-9]+' | head -1 || true)
+            [ -n "$KEY" ] && RULE="first match in body (weakest signal)"
+          fi
+
+          ALL=$(printf '%s' "$BODY" | grep -oE '[A-Z][A-Z0-9]+-[0-9]+' | sort -u | tr '\n' ' ')
+          [ -n "$ALL" ] && echo "Keys present in description: $ALL"
+          [ -n "$KEY" ] && echo "Resolved $KEY via: $RULE"
 
           if [ -z "$KEY" ]; then
             echo "No ticket key in the PR description."
